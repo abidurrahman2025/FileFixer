@@ -8,6 +8,8 @@ What the guard does (best effort - see the note at the bottom):
   * File access outside those folders is refused (reading Python's own library is allowed).
   * Network access, starting programs, ctypes and similar are refused.
   * A time limit (default 20 s) and (Linux and macOS only) a memory limit are enforced.
+    On Linux and macOS the script also cannot start new processes or threads, which stops runaway scripts.
+  * HOME and the temporary-files folder point inside scratch/, so Python's own temp files stay inside the walls.
   * Results are only copied to your real folders after you review and approve them.
 
 Honest limits: this is a guard rail for scripts you write or have read, not a security boundary
@@ -98,7 +100,12 @@ def run_script(code: str, inputs=(), timeout: float = 20, mem_mb: int = 512,
         shutil.copy2(src, work / "input" / name)
     script = work / "script.py"
     script.write_text(code, "utf-8")
-    env = {"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "PATH": ""}
+    home = work / "scratch"
+    temp = home / "tmp"
+    temp.mkdir()
+    env = {"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "PATH": "",
+           "HOME": str(home), "USERPROFILE": str(home),
+           "TEMP": str(temp), "TMP": str(temp), "TMPDIR": str(temp)}
     if os.name == "nt":
         env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", r"C:\Windows")
     res = SandboxResult(workdir=work)
@@ -137,14 +144,19 @@ def run_script(code: str, inputs=(), timeout: float = 20, mem_mb: int = 512,
 # --------------------------------------------------------------------------
 def boot(argv: list) -> None:
     script, work, mem_mb, timeout = Path(argv[0]), Path(argv[1]).resolve(), int(argv[2]), int(argv[3])
-    try:
-        import resource
-        if mem_mb > 0:
-            resource.setrlimit(resource.RLIMIT_AS, (mem_mb * 1024 * 1024,) * 2)
-        resource.setrlimit(resource.RLIMIT_CPU, (timeout + 5,) * 2)
-        resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_FILE_BYTES,) * 2)
-    except (ImportError, ValueError, OSError):
-        pass                                           # Windows: time limit only
+    def limit(name: str, value: int) -> None:
+        """Set one resource limit. A limit this system doesn't have (Windows) is simply skipped."""
+        try:
+            import resource
+            resource.setrlimit(getattr(resource, name), (value, value))
+        except (ImportError, AttributeError, ValueError, OSError):
+            pass                                       # Windows: time limit only
+
+    if mem_mb > 0:
+        limit("RLIMIT_AS", mem_mb * 1024 * 1024)
+    limit("RLIMIT_CPU", timeout + 5)
+    limit("RLIMIT_FSIZE", MAX_FILE_BYTES)
+    limit("RLIMIT_NPROC", 0)                           # no new processes or threads: stops fork bombs
 
     import sysconfig
     real = os.path.realpath

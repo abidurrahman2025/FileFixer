@@ -63,6 +63,33 @@ def check_name_text(text: str, what: str) -> None:
                         "(Windows doesn't allow them in file names.)")
 
 
+RESERVED_NAMES = ({"CON", "PRN", "AUX", "NUL"}
+                  | {f"COM{d}" for d in "123456789\u00b9\u00b2\u00b3"}
+                  | {f"LPT{d}" for d in "123456789\u00b9\u00b2\u00b3"})
+
+
+def name_problem(name: str) -> Optional[str]:
+    """Why Windows would refuse this whole file or folder name, or None if it is fine.
+
+    Windows drops a trailing dot or space and treats CON, PRN, AUX, NUL, COM1-9 and
+    LPT1-9 as devices (with or without an extension), so none of those can be created.
+    """
+    if name != name.rstrip(". "):
+        return "it ends with a dot or a space"
+    if name.split(".")[0].rstrip(" ").upper() in RESERVED_NAMES:
+        return "Windows keeps that name for itself"
+    return None
+
+
+def check_new_name(name: str, what: str) -> None:
+    """Like check_name_text, but for a complete name the user typed for a new file or folder."""
+    check_name_text(name, what)
+    why = name_problem(name)
+    if why:
+        raise UserError(f"{what} can't be “{name}” because {why}.\n"
+                        "(Windows doesn't allow that in file names. Please choose a different name.)")
+
+
 def natural_key(name: str) -> list:
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name.lower())]
 
@@ -125,7 +152,7 @@ class BulkRename(Recipe):
         width = max(3, len(str(len(files))))
 
         plan = Plan(self.name)
-        namer, unchanged, skipped = Namer(), 0, 0
+        namer, unchanged, skipped, bad_names = Namer(), 0, 0, 0
         for i, p in enumerate(files, 1):
             stem, ext = p.stem, p.suffix
             if mode == R_MODES[0]:
@@ -151,6 +178,9 @@ class BulkRename(Recipe):
             if not new.strip(". "):
                 skipped += 1
                 continue
+            if name_problem(new):
+                bad_names += 1
+                continue
             dst = namer.reserve(p.with_name(new), src=p)
             plan.actions.append(Action("move", f"{rel(p, folder)}   →   {dst.name}", p, dst))
 
@@ -161,6 +191,8 @@ class BulkRename(Recipe):
             plan.notes.append(f"{plural(unchanged, 'file')} already match and will be left alone.")
         if skipped:
             plan.notes.append(f"{plural(skipped, 'file')} skipped because the new name would be empty.")
+        if bad_names:
+            plan.notes.append(f"{plural(bad_names, 'file')} skipped because the new name isn't allowed on Windows.")
         if not files:
             plan.notes.append("No matching files were found in that folder.")
         return plan
@@ -435,13 +467,16 @@ class MergeText(Recipe):
         out_name = v["out"].strip()
         if not out_name:
             raise UserError("Please type a name for the new file.")
-        check_name_text(out_name, "The file name")
         if not Path(out_name).suffix:
             out_name += ".txt"
+        check_new_name(out_name, "The file name")
         wanted_out = folder / out_name
 
+        # A file with the output's name is left out at any depth, so an old combined.txt
+        # inside a subfolder is never merged into the new one.
+        out_key = norm(out_name)
         files = [p for p in list_files(folder, v["sub"], parse_exts(v["types"]))
-                 if norm(p) != norm(wanted_out)]
+                 if norm(p.name) != out_key]
         not_text = [p for p in files if not looks_like_text(p)]
         files = [p for p in files if p not in not_text]
         if v["order"] == M_ORDERS[0]:
@@ -516,7 +551,7 @@ def parse_rules(text: str) -> list:
         name, rhs = (s.strip() for s in line.split("=", 1))
         if not name.strip(". "):
             raise UserError(f"This line has no folder name before the equals sign:\n    {line}")
-        check_name_text(name, "A folder name")
+        check_new_name(name, "A folder name")
         exts, words = set(), []
         for tok in re.split(r"[,;]", rhs):
             tok = tok.strip().lower().lstrip("*").strip()
@@ -574,10 +609,10 @@ class DeliveryPackage(Recipe):
         name = v["name"].strip().rstrip(". ")
         if not name:
             raise UserError("Please type a name for the package.")
-        check_name_text(name, "The package name")
+        check_new_name(name, "The package name")
         rules = parse_rules(v["rules"])
         other = v["other"].strip() or "Other"
-        check_name_text(other, "The 'everything else' folder name")
+        check_new_name(other, "The 'everything else' folder name")
 
         try:
             out_parent = check_folder(v["outdir"] if v["outdir"].strip() else str(folder.parent))
@@ -609,14 +644,23 @@ class DeliveryPackage(Recipe):
             plan.summary = "There are no files to package."
             return plan
 
-        namer, entries = Namer(), []
+        namer, entries, bad_names = Namer(), [], 0
         for p in files:
             cat = categorize(p, rules, other)
             new = p.name if v["naming"] == P_NAMING[0] else tidy_name(p.name)
             if v["naming"] == P_NAMING[2]:
                 new = f"{datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d}_{new}"
+            if name_problem(new):
+                bad_names += 1
+                continue
             entries.append((cat, namer.reserve(pkg / cat / new), p))
         entries.sort(key=lambda e: (natural_key(e[0]), natural_key(e[1].name)))
+
+        if not entries:
+            plan.summary = "There are no files to package."
+            if bad_names:
+                plan.notes.append(f"{plural(bad_names, 'file')} skipped because the new name isn't allowed on Windows.")
+            return plan
 
         for cat, dst, p in entries:
             plan.actions.append(Action("copy", f"{rel(p, folder)}   →   {cat}{os.sep}{dst.name}", p, dst))
@@ -650,6 +694,8 @@ class DeliveryPackage(Recipe):
                         f"{plural(len(entries), 'file')} in {plural(len(cats), 'folder')} "
                         f"({size_text(total)})" + (", plus a .zip file." if zip_path else "."))
         plan.notes.append("Your original files are not touched - the package is made from copies.")
+        if bad_names:
+            plan.notes.append(f"{plural(bad_names, 'file')} skipped because the new name isn't allowed on Windows.")
         if dupes:
             plan.notes.append(f"{plural(dupes, 'duplicate file')} left out (one copy of each is kept).")
         if junk:

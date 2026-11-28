@@ -2,6 +2,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -298,6 +299,132 @@ class TestSync(Base):
             engine.reset_cancel()
 
 
+class TestSyncSafety(TestSync):
+    # (inherits TestSync's helpers; its own tests are removed below so they don't run twice)
+    """Files that change between the preview and 'Do it', ties, interrupted copies, odd links, oversized zips."""
+
+    def plan2(self, key="sync", **over):
+        over.setdefault("roots", str(self.tmp / "apps"))                       # just two places: A and B
+        return self.plan(key, **over)
+
+    def go2(self, **over):
+        over.setdefault("roots", str(self.tmp / "apps"))
+        return self.go(**over)
+
+    def test_file_edited_after_the_preview_is_left_alone(self):
+        self.put(self.a, "mod.txt", "NEW", 2_000_000_000); self.put(self.b, "mod.txt", "old", 1_000_000_000)
+        self.put(self.a, "keep.txt", "k")
+        plan = self.plan2()
+        self.assertEqual(len(plan.actions), 2)
+        self.put(self.b, "mod.txt", "I EDITED THIS AFTER THE PREVIEW")        # the user keeps working
+        res = engine.apply_plan(plan)
+        self.assertEqual((self.b / "mod.txt").read_text(), "I EDITED THIS AFTER THE PREVIEW")
+        self.assertEqual(len(res["problems"]), 1)
+        self.assertIn("changed after the preview", res["problems"][0])
+        self.assertEqual((self.b / "keep.txt").read_text(), "k")             # the rest still went through
+
+    def test_new_file_appearing_at_the_destination_is_not_replaced(self):
+        self.put(self.a, "n.txt", "from A")
+        plan = self.plan2()
+        self.put(self.b, "n.txt", "already here")
+        res = engine.apply_plan(plan)
+        self.assertEqual((self.b / "n.txt").read_text(), "already here")
+        self.assertEqual(len(res["problems"]), 1)
+
+    def test_removal_is_refused_if_the_file_changed(self):
+        self.put(self.a, "keep.txt", "k"); self.put(self.b, "gone.txt", "g")
+        plan = self.plan2(deletes=True)
+        self.assertEqual([a.kind for a in plan.actions], ["copy", "trash"])
+        self.put(self.b, "gone.txt", "g but now with new work in it")
+        res = engine.apply_plan(plan)
+        self.assertTrue((self.b / "gone.txt").exists())
+        self.assertEqual(len(res["problems"]), 1)
+
+    def test_unchanged_files_still_apply(self):
+        self.put(self.a, "mod.txt", "NEW", 2_000_000_000); self.put(self.b, "mod.txt", "old", 1_000_000_000)
+        self.go2()
+        self.assertEqual((self.b / "mod.txt").read_text(), "NEW")
+
+    def test_interrupted_copy_leaves_no_half_file(self):
+        from unittest import mock
+        import shutil
+        self.put(self.a, "big.bin", "data")
+        plan = self.plan2()
+
+        def dies_halfway(src, dst, **k):
+            Path(dst).write_bytes(b"da")
+            raise OSError("disk unplugged")
+
+        with mock.patch.object(shutil, "copy2", dies_halfway):
+            res = engine.apply_plan(plan)
+        self.assertEqual(len(res["problems"]), 1)
+        self.assertEqual(self.tree(self.b), [])                               # no half-written file, no leftover temp
+        self.go2()
+        self.assertEqual((self.b / "big.bin").read_text(), "data")            # and a retry just works
+
+    def test_newest_wins_only_when_clearly_newer(self):
+        self.put(self.a, "f.txt", "A version", 1_700_000_000); self.put(self.b, "f.txt", "B version", 1_700_000_001)
+        mode = __import__("r_sync").SYNC_MODES[1]
+        rule = __import__("r_sync").CONFLICT_RULES[1]
+        plan = self.plan2(mode=mode, conflicts=rule)
+        self.assertEqual([a.kind for a in plan.actions if "f.txt" in a.sentence and a.kind == "overwrite"], [])
+        self.assertTrue(any("CONFLICT" in ln for ln in plan.report))           # 1 second apart: too close to call
+        self.put(self.b, "f.txt", "B version", 1_700_000_100)
+        plan = self.plan2(mode=mode, conflicts=rule)
+        self.assertTrue(any(a.kind == "overwrite" for a in plan.actions))      # clearly newer: decided
+
+    def test_junctions_are_recognised_but_onedrive_placeholders_are_not(self):
+        from types import SimpleNamespace as NS
+        self.assertTrue(engine.is_junction_stat(NS(st_file_attributes=0x410, st_reparse_tag=0xA0000003)))
+        self.assertFalse(engine.is_junction_stat(NS(st_file_attributes=0x400, st_reparse_tag=0x9000001A)))   # OneDrive
+        self.assertFalse(engine.is_junction_stat(NS(st_file_attributes=0x20, st_reparse_tag=0)))
+        self.assertFalse(engine.is_junction_stat(NS()))                                                       # Linux/macOS
+        link = self.tmp / "link"
+        try:
+            os.symlink(self.a, link)
+        except (OSError, NotImplementedError):
+            self.skipTest("symbolic links not available")
+        self.assertTrue(engine.is_link(link))
+        self.assertFalse(engine.is_link(self.a))
+
+    def test_symlinked_folders_are_not_searched_or_synced(self):
+        self.put(self.a, "a.txt", "1")
+        outside = self.tmp / "outside" / "folder1"; outside.mkdir(parents=True)
+        self.put(outside, "secret.txt", "s")
+        try:
+            os.symlink(outside.parent, self.tmp / "apps" / "sneaky")
+        except (OSError, NotImplementedError):
+            self.skipTest("symbolic links not available")
+        plan = self.plan2(roots=str(self.tmp / "apps"))
+        self.assertTrue(all("secret" not in a.sentence and str(outside) not in str(a.dst) for a in plan.actions))
+
+    def test_long_path_errors_are_explained(self):
+        e = OSError(); e.winerror = 206
+        self.assertIn("too long", engine.friendly(e))
+        import errno
+        self.assertIn("too long", engine.friendly(OSError(errno.ENAMETOOLONG, "File name too long")))
+        self.assertNotIn("too long", engine.friendly(FileNotFoundError()))
+
+    def test_zip_bombs_are_refused_not_unpacked(self):
+        import readers
+        import zipfile
+        p = self.tmp / "bomb.docx"
+        with zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("word/document.xml", b"<a>" + b"A" * 5_000_000)
+        old = readers.MAX_PART_BYTES
+        readers.MAX_PART_BYTES = 1_000_000
+        try:
+            with self.assertRaises(UserError) as cm:
+                readers.read_document(p)
+        finally:
+            readers.MAX_PART_BYTES = old
+        self.assertIn("unpacks to far more", str(cm.exception))
+
+
+for _name in [n for n in vars(TestSync) if n.startswith("test_")]:
+    setattr(TestSyncSafety, _name, None)
+
+
 class TestWatch(TestSync):
     def watcher(self, auto, **over):
         S = __import__("r_sync")
@@ -536,6 +663,37 @@ class TestNL(Base):
         self.assertEqual((i.key, i.values["mode"]), ("watch", __import__("r_sync").SYNC_MODES[1]))
         self.assertIsNone(nl.interpret("what is the weather like", [], []))
 
+    def test_emails_without_a_verb_and_quoted_prefixes(self):
+        import nl
+        import r_more as M
+        import recipes as R
+        g = self.make("GroceryItems.txt", GROCERY)
+        for phrase in ("find emails in the folder", "emails in the folder", "email addresses in this folder",
+                       "web links from these files"):
+            i = nl.interpret(phrase, [], [self.tmp])
+            self.assertIsNotNone(i, phrase)
+            self.assertEqual((i.key, i.missing), ("emails", []), phrase)
+        self.assertEqual(nl.interpret("links in these files", [g], []).values["what"], M.WHAT[1])
+        for phrase in ("send emails to my boss", "delete emails in this folder", "I like emails"):
+            i = nl.interpret(phrase, [], [self.tmp])
+            self.assertTrue(i is None or i.key != "emails", phrase)
+        for phrase, text, mode in (('add "2024" to the start of every name', "2024", R.R_MODES[0]),
+                                   ('add "2024" to the start of every file name', "2024", R.R_MODES[0]),
+                                   ('add "My Trip " to the start of every name', "My Trip ", R.R_MODES[0]),
+                                   ("add \u201c2024-\u201d to the beginning of all file names", "2024-", R.R_MODES[0]),
+                                   ("add 2024 to the start of every name", "2024", R.R_MODES[0]),
+                                   ('add "_final" to the end of every name', "_final", R.R_MODES[1])):
+            i = nl.interpret(phrase, [], [self.tmp])
+            self.assertIsNotNone(i, phrase)
+            self.assertEqual((i.key, i.values["mode"], i.values["text"], i.missing), ("rename", mode, text, []), phrase)
+        self.assertIsNone(nl.interpret('add "x" to the start of every line', [], [self.tmp]))
+
+    def test_every_suggestion_still_parses(self):
+        import nl
+        g = self.make("GroceryItems.txt", GROCERY)
+        for phrase in nl.SUGGESTIONS:
+            self.assertIsNotNone(nl.interpret(phrase, [g], [self.tmp]), phrase)
+
     def test_intent_runs_end_to_end(self):
         import nl
         g = self.make("GroceryItems.txt", GROCERY)
@@ -544,6 +702,238 @@ class TestNL(Base):
         plan = r.plan(vals(r, **i.values))
         engine.apply_plan(plan)
         self.assertTrue((self.tmp / "GroceryItemsList.txt").read_text().startswith("1. itm_apple"))
+
+
+NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def make_workbook(path, sheets, order=None, strings=(), broken_workbook=False):
+    """sheets: {file number: raw <row> xml}.  order: [(sheet name, file number)] for workbook.xml."""
+    import zipfile
+    with zipfile.ZipFile(path, "w") as z:
+        for n, rows in sheets.items():
+            z.writestr(f"xl/worksheets/sheet{n}.xml",
+                       f'<worksheet xmlns="{NS_MAIN}"><sheetData>{rows}</sheetData></worksheet>')
+        if strings:
+            z.writestr("xl/sharedStrings.xml", f'<sst xmlns="{NS_MAIN}">' +
+                       "".join(f"<si><t>{t}</t></si>" for t in strings) + "</sst>")
+        if broken_workbook:
+            z.writestr("xl/workbook.xml", "<workbook><sheets>")
+        elif order:
+            z.writestr("xl/workbook.xml", f'<workbook xmlns="{NS_MAIN}" xmlns:r="{NS_REL}"><sheets>' +
+                       "".join(f'<sheet name="{nm}" sheetId="{i}" r:id="rId{i}"/>' for i, (nm, _) in enumerate(order, 1)) +
+                       "</sheets></workbook>")
+            z.writestr("xl/_rels/workbook.xml.rels",
+                       '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+                       "".join(f'<Relationship Id="rId{i}" Type="x" Target="worksheets/sheet{n}.xml"/>'
+                               for i, (_, n) in enumerate(order, 1)) + "</Relationships>")
+
+
+class TestXlsxReader(Base):
+    def read(self, **kw):
+        import readers
+        p = self.tmp / "t.xlsx"
+        make_workbook(p, **kw)
+        return readers.read_document(p)[0]
+
+    def test_cells_without_references_are_placed_in_order(self):
+        text = self.read(sheets={1: '<row><c t="inlineStr"><is><t>a</t></is></c><c><v>2</v></c><c><v>3</v></c></row>'
+                                    '<row><c r="B2"><v>9</v></c><c><v>10</v></c></row>'})
+        self.assertEqual(text, "a\t2\t3\n\t9\t10")
+
+    def test_numeric_only_and_odd_references_never_crash(self):
+        import readers
+        self.assertEqual(readers._col("C7"), 3)
+        self.assertEqual(readers._col("AB1"), 28)
+        for odd in ("7", "", "$"):
+            self.assertEqual(readers._col(odd), 0)
+        text = self.read(sheets={1: '<row><c r="7"><v>1</v></c><c r="9"><v>2</v></c></row>'})
+        self.assertEqual(text, "1\t2")
+
+    def test_booleans_errors_and_blanks(self):
+        text = self.read(sheets={1: '<row r="1"><c r="A1" t="b"><v>1</v></c><c r="B1" t="b"><v>0</v></c>'
+                                    '<c r="C1" t="e"><v>#DIV/0!</v></c><c r="D1" t="s"><v>0</v></c>'
+                                    '<c r="E1" t="s"><v>99</v></c><c r="F1" t="d"><v>2026-01-31</v></c></row>'},
+                         strings=["word"])
+        self.assertEqual(text, "TRUE\tFALSE\t\tword\t\t2026-01-31")
+
+    def test_sheets_follow_the_workbook_order(self):
+        import readers
+        sheets = {1: '<row><c r="A1" t="inlineStr"><is><t>data</t></is></c></row>',
+                  2: '<row><c r="A1" t="inlineStr"><is><t>summary</t></is></c></row>',
+                  10: '<row><c r="A1" t="inlineStr"><is><t>last</t></is></c></row>'}
+        order = [("Summary", 2), ("Data", 1), ("Archive", 10)]
+        self.assertEqual(self.read(sheets=sheets, order=order), "summary\ndata\nlast")
+        self.assertEqual(readers.xlsx_sheet_names(self.tmp / "t.xlsx"), ["Summary", "Data", "Archive"])
+
+    def test_damaged_workbook_falls_back_to_file_order(self):
+        import readers
+        sheets = {10: '<row><c t="inlineStr"><is><t>ten</t></is></c></row>',
+                  2: '<row><c t="inlineStr"><is><t>two</t></is></c></row>',
+                  1: '<row><c t="inlineStr"><is><t>one</t></is></c></row>'}
+        self.assertEqual(self.read(sheets=sheets, broken_workbook=True), "one\ntwo\nten")
+        self.assertEqual(readers.xlsx_sheet_names(self.tmp / "t.xlsx"), ["sheet1", "sheet2", "sheet10"])
+        self.assertEqual(self.read(sheets=sheets), "one\ntwo\nten")                # no workbook at all
+
+    def test_spreadsheet_job_uses_the_first_sheet_in_workbook_order(self):
+        import r_more
+        p = self.tmp / "t.xlsx"
+        make_workbook(p, sheets={1: '<row><c t="inlineStr"><is><t>other</t></is></c></row>',
+                                 2: '<row><c t="inlineStr"><is><t>name</t></is></c></row>'
+                                    '<row><c t="inlineStr"><is><t>Ann</t></is></c></row>'},
+                      order=[("People", 2), ("Misc", 1)])
+        head, rows, _, _ = r_more.read_table(p)
+        self.assertEqual((head, rows), (["name"], [["Ann"], ["other"]]))
+
+
+class FakeText:
+    def __init__(self):
+        self.content = ""
+
+    def configure(self, **kw):
+        pass
+
+    def delete(self, a, b):
+        self.content = ""
+
+    def insert(self, where, text):
+        self.content = text
+
+
+class TestAdvancedWindowLogic(Base):
+    """Batch preview/run logic of the Advanced Tools window, with Tkinter replaced by stand-ins (runs anywhere)."""
+
+    def setUp(self):
+        super().setUp()
+        import sys
+        import threading
+        import types
+        from unittest import mock
+        tk = mock.MagicMock()
+        tk.TclError = type("TclError", (Exception,), {})
+        mods = {"tkinter": tk, "tkinter.font": mock.MagicMock(), "tkinter.filedialog": mock.MagicMock(),
+                "tkinter.messagebox": mock.MagicMock(), "tkinter.ttk": mock.MagicMock()}
+        tk.messagebox, tk.ttk, tk.filedialog = mods["tkinter.messagebox"], mods["tkinter.ttk"], mods["tkinter.filedialog"]
+        patcher = mock.patch.dict(sys.modules, mods)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        sys.modules.pop("advanced", None)
+        import advanced
+        self.adv, self.messagebox = advanced, tk.messagebox
+        self.pending = []
+        w = advanced.AdvancedWindow.__new__(advanced.AdvancedWindow)
+        w.win = types.SimpleNamespace(after=lambda ms, fn: self.pending.append(fn), winfo_exists=lambda: True)
+        w.batch_text = FakeText()
+        w.batch_preview_btn, w.batch_run_btn = mock.MagicMock(), mock.MagicMock()
+        w.batch_files = [str(self.tmp / "a.txt")]
+        w.batch_out = types.SimpleNamespace(get=lambda: str(self.tmp))
+        w.batch_suffix = types.SimpleNamespace(get=lambda: "_r")
+        w.batch_wf = types.SimpleNamespace(get=lambda: "(the steps in the Workflow Builder)")
+        w.steps, w._batching, w._applying = [{"op": "number", "params": {}}], False, False
+        w.app = mock.MagicMock()
+        self.w, self.threading = w, threading
+
+    def pump(self):
+        for _ in range(500):
+            if not self.pending:
+                break
+            self.pending.pop(0)()
+            time.sleep(0.005)
+        self.assertEqual(self.pending, [])
+
+    def test_preview_builds_the_plan_off_the_window_thread(self):
+        from unittest import mock
+        gate, started = self.threading.Event(), self.threading.Event()
+        plan = engine.Plan("Batch")
+        plan.summary = "2 files will get a result."
+
+        def slow(*a):
+            started.set()
+            gate.wait(5)
+            return plan
+
+        with mock.patch.object(self.adv.W, "batch_plan", slow):
+            self.w.batch_preview()                              # returns at once even though the worker is busy
+            self.assertTrue(started.wait(5))
+            self.assertTrue(self.w._batching)
+            self.assertEqual(self.w.batch_text.content, "Looking at your files...")
+            self.w.batch_preview_btn.config.assert_called_with(state="disabled")
+            self.w.batch_run_btn.config.assert_called_with(state="disabled")
+            self.w.batch_run()                                  # a second click is refused, not queued
+            self.messagebox.showinfo.assert_called_once()
+            gate.set()
+            self.pump()
+        self.assertFalse(self.w._batching)
+        self.assertIn("2 files will get a result.", self.w.batch_text.content)
+        self.w.batch_preview_btn.config.assert_called_with(state="normal")
+        self.w.batch_run_btn.config.assert_called_with(state="normal")
+
+    def test_run_applies_the_plan_it_built(self):
+        from unittest import mock
+        plan = engine.Plan("Batch")
+        with mock.patch.object(self.adv.W, "batch_plan", lambda *a: plan), \
+                mock.patch.object(self.adv.AdvancedWindow, "apply_and_report") as apply:
+            self.w.batch_run()
+            self.pump()
+        apply.assert_called_once()
+        self.assertIs(apply.call_args[0][0], plan)
+        self.assertEqual(apply.call_args[0][2], "Batch of 1 files")
+
+    def test_problems_are_reported_and_the_buttons_come_back(self):
+        from unittest import mock
+        self.w.batch_files = []
+        with mock.patch.object(self.adv.AdvancedWindow, "err") as err:
+            self.w.batch_preview()                              # no files: reported at once, nothing starts
+            err.assert_called_once()
+        self.assertFalse(self.w._batching)
+        self.w.batch_files = [str(self.tmp / "a.txt")]
+
+        def boom(*a):
+            raise UserError("no luck")
+
+        with mock.patch.object(self.adv.W, "batch_plan", boom), mock.patch.object(self.adv.AdvancedWindow, "err") as err:
+            self.w.batch_preview()
+            self.pump()
+            err.assert_called_once()
+        self.assertFalse(self.w._batching)
+        self.w.batch_preview_btn.config.assert_called_with(state="normal")
+        self.assertEqual(self.w.batch_text.content, "")
+
+
+class TestWheelHelper(Base):
+    def test_wheel_binds_windows_mac_and_linux_events(self):
+        import sys
+        from unittest import mock
+        tk = mock.MagicMock()
+        tk.TclError = type("TclError", (Exception,), {})
+        mods = {"tkinter": tk, "tkinter.font": mock.MagicMock(), "tkinter.filedialog": mock.MagicMock(),
+                "tkinter.messagebox": mock.MagicMock(), "tkinter.ttk": mock.MagicMock()}
+        with mock.patch.dict(sys.modules, mods):
+            sys.modules.pop("app", None)
+            import app
+
+            class Widget:
+                def __init__(s):
+                    s.bound, s.bound_all = {}, {}
+
+                def bind(s, seq, fn):
+                    s.bound[seq] = fn
+
+                def bind_all(s, seq, fn):
+                    s.bound_all[seq] = fn
+
+            for everywhere in (False, True):
+                w, seen = Widget(), []
+                app.wheel(w, seen.append, everywhere=everywhere)
+                table = w.bound_all if everywhere else w.bound
+                self.assertEqual(sorted(table), ["<Button-4>", "<Button-5>", "<MouseWheel>"])
+                self.assertEqual(w.bound_all if not everywhere else w.bound, {})
+                E = lambda d: mock.Mock(delta=d)
+                table["<Button-4>"](E(0)); table["<Button-5>"](E(0))             # Linux: up then down
+                table["<MouseWheel>"](E(120)); table["<MouseWheel>"](E(-120))    # Windows: up then down
+                table["<MouseWheel>"](E(1)); table["<MouseWheel>"](E(-1))        # macOS: small deltas
+                self.assertEqual(seen, [-1, 1, -1, 1, -1, 1])
 
 
 class TestSandbox(Base):
@@ -608,6 +998,40 @@ class TestSandbox(Base):
     def test_memory_limit(self):
         r = self.sb("x = bytearray(2 * 1024 * 1024 * 1024)", mem_mb=256)
         self.assertFalse(r.ok); self.assertIn("MemoryError", r.stderr)
+
+    @unittest.skipIf(os.name == "nt", "these checks use POSIX paths")
+    def test_walls_hold_in_a_real_child_process(self):
+        """The three classic escapes, each run in an actual sandbox process: all refused or stopped."""
+        for name, code, timeout in (
+                ("read /etc/passwd", "print(open('/etc/passwd').read())", 20),
+                ("open a socket", "import socket; socket.socket()", 20),
+                ("endless printing", "while True: print('x' * 1000)", 10)):
+            r = self.sb(code, timeout=timeout)
+            self.assertFalse(r.ok, name)
+            self.assertNotIn("root:", r.stdout, name)
+        r = self.sb("print(open('/etc/passwd').read())")
+        self.assertIn("sandbox", r.stderr)
+        r = self.sb("import socket; socket.socket()")
+        self.assertIn("network access", r.stderr)
+
+    @unittest.skipIf(os.name == "nt", "temp-folder variables are checked on Linux and macOS")
+    def test_home_and_temp_point_inside_the_sandbox(self):
+        r = self.sb("import os, tempfile\n"
+                    "print(os.environ['HOME']); print(os.environ['TMPDIR']); print(tempfile.gettempdir())\n"
+                    "fd, path = tempfile.mkstemp(); os.close(fd); print(path)\n"
+                    "print(os.path.expanduser('~'))")
+        self.assertTrue(r.ok, r.stderr)
+        scratch = str(r.workdir / "scratch")
+        lines = r.stdout.split()
+        self.assertEqual(len(lines), 5)
+        for line in lines:
+            self.assertTrue(os.path.realpath(line).startswith(os.path.realpath(scratch)), line)
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                     "the process limit isn't enforced on Windows or for the root user")
+    def test_cannot_start_new_threads_or_processes(self):
+        r = self.sb("import threading\nthreading.Thread(target=lambda: None).start()")
+        self.assertFalse(r.ok)
 
     def test_allowed_normal_work(self):
         r = self.sb("import json, re, csv, datetime, collections, math\n"

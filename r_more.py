@@ -16,7 +16,7 @@ import readers
 from engine import (Action, Namer, Plan, SKIP_NAMES, UserError, check_cancel, check_file, check_folder,
                     decode_bytes, norm, parse_exts, size_text)
 from r_extract import RESULT
-from recipes import Field, Recipe, check_name_text, natural_key, plural, rel
+from recipes import Field, Recipe, check_name_text, check_new_name, natural_key, plural, rel
 
 NL = "\r\n" if os.name == "nt" else "\n"
 
@@ -44,9 +44,9 @@ def deliver(plan: Plan, src: Optional[Path], body: str, v: dict, default_name: s
         plan.notes.append("The original is saved to the Recycle folder first, so “Undo last change” restores it.")
         return plan
     name = (v.get("outname") or "").strip() or default_name
-    check_name_text(name, "The file name")
     if not Path(name).suffix:
         name += Path(default_name).suffix or ".txt"
+    check_new_name(name, "The file name")
     outdir = check_folder(v["outdir"]) if (v.get("outdir") or "").strip() else (src.parent if src else None)
     if outdir is None:
         raise UserError("Please choose where to save the new file.")
@@ -73,7 +73,8 @@ def _walk(folder: Path, sub: bool, want_dirs: bool = False):
         check_cancel()
         d = stack.pop()
         try:
-            entries = sorted(os.scandir(d), key=lambda e: e.name.lower())
+            with os.scandir(d) as it:
+                entries = sorted(it, key=lambda e: e.name.lower())
         except OSError:
             continue
         for e in entries:
@@ -125,7 +126,9 @@ class FindFiles(Recipe):
             for p, is_dir in _walk(folder, v["sub"], want_dirs=True):
                 if is_dir and (not needle or needle in p.name.lower()):
                     try:
-                        if not any(True for _ in os.scandir(p)):
+                        with os.scandir(p) as it:
+                            empty = next(it, None) is None
+                        if empty:
                             rows.append((p, 0, p.stat().st_mtime))
                     except OSError:
                         pass
@@ -488,8 +491,6 @@ class CsvTools(Recipe):
             plan.summary = f"{plural(len(rows), 'row')} converted."
             deliver(plan, None, body, dict(v, result=RESULT[0], outdir=v["outdir"] or str(src.parent)),
                     f"{src.stem}{new_ext}", enc="utf-8-sig" if enc == "utf-8-sig" else "utf-8")
-            if plan.actions[-1].dst.suffix == "":
-                pass
             return plan
         head2, rows2 = res
         body = write_table(head2, rows2, delim)

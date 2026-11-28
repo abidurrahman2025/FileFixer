@@ -8,10 +8,12 @@ Safety rules the whole app relies on:
 from __future__ import annotations
 
 import codecs
+import errno
 import json
 import os
 import shutil
 import threading
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass, field
@@ -68,6 +70,9 @@ class Action:
     detail: str = ""                # extra preview lines (optional)
     transform: Optional[Callable[[str], str]] = None        # for "edit"
     produce: Optional[Callable[[], tuple]] = None           # for "write": -> (text, encoding)
+    # What the files looked like when the preview was made: [(path, size, mtime)], or size None = "must not exist".
+    # If anything has changed by the time the action runs, it is refused instead of acting on stale information.
+    guard: list = field(default_factory=list)
 
 
 @dataclass
@@ -159,7 +164,7 @@ def list_files(folder: Path, subfolders: bool, exts: Optional[set] = None) -> li
         n = p.name
         if n.startswith(".") or n.startswith("~$") or n.lower() in SKIP_NAMES:
             return False
-        if p.is_symlink() or not p.is_file():
+        if is_link(p) or not p.is_file():
             return False
         return not exts or p.suffix.lower() in exts
 
@@ -170,7 +175,7 @@ def list_files(folder: Path, subfolders: bool, exts: Optional[set] = None) -> li
             rp = Path(root)
             dirs[:] = sorted(d for d in dirs
                              if not d.startswith(".")
-                             and not (rp / d).is_symlink()
+                             and not is_link(rp / d)
                              and (rp / d).resolve() != app)
             result += [rp / f for f in sorted(files) if keep(rp / f)]
     else:
@@ -233,7 +238,30 @@ def size_text(n: float) -> str:
     return f"{n:.1f} GB"
 
 
+IS_WINDOWS = os.name == "nt"
+_REPARSE_FLAG, _MOUNT_POINT_TAG = 0x400, 0xA0000003
+
+
+def is_junction_stat(st) -> bool:
+    """True for a Windows junction / mount point. Other reparse points (OneDrive placeholders) are real files."""
+    return bool(getattr(st, "st_file_attributes", 0) & _REPARSE_FLAG) and getattr(st, "st_reparse_tag", 0) == _MOUNT_POINT_TAG
+
+
+def is_link(p) -> bool:
+    """A symbolic link or Windows junction: something that points somewhere else and is never followed."""
+    try:
+        if os.path.islink(p):
+            return True
+        return IS_WINDOWS and is_junction_stat(os.lstat(p))
+    except OSError:
+        return False
+
+
 def friendly(e: BaseException) -> str:
+    if getattr(e, "winerror", None) == 206 or getattr(e, "errno", None) == errno.ENAMETOOLONG or \
+            (isinstance(e, FileNotFoundError) and IS_WINDOWS and len(str(getattr(e, "filename", "") or "")) > 259):
+        return ("the file's full path is too long for Windows (over 260 characters). "
+                "Use a shorter folder or file name and try again")
     if isinstance(e, PermissionError):
         return "not allowed (the file may be open in another program, or read-only)"
     if isinstance(e, FileNotFoundError):
@@ -278,7 +306,21 @@ def _move(src: Path, dst: Path) -> None:
     shutil.move(str(src), str(dst))
 
 
+def _check_guard(a: Action) -> None:
+    for path, size, mtime in a.guard:
+        try:
+            st = os.lstat(path)
+            now = (st.st_size, st.st_mtime)
+        except OSError:
+            now = None
+        want = None if size is None else (size, mtime)
+        if now != want:
+            raise UserError(f"{Path(path).name} changed after the preview was made, so it was left alone. "
+                            "Show me what will happen again to include the newer version")
+
+
 def _do(a: Action, bdir: Path) -> Optional[dict]:
+    _check_guard(a)
     if a.kind == "move":
         made = _missing_dirs(a.dst.parent)
         _move(a.src, a.dst)
@@ -342,7 +384,15 @@ def _do(a: Action, bdir: Path) -> Optional[dict]:
             raise FileExistsError(f"'{a.dst.name}' already exists there")
         made = _missing_dirs(a.dst.parent)
         a.dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(a.src, a.dst)
+        tmp = a.dst.with_name(a.dst.name + ".fftmp")          # copy aside first: an interrupted copy never leaves a half file
+        try:
+            shutil.copy2(a.src, tmp)
+            if a.dst.exists():
+                raise FileExistsError(f"'{a.dst.name}' already exists there")
+            os.replace(tmp, a.dst)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
         return {"op": "copy", "src": "", "dst": str(a.dst), "made": [str(d) for d in made]}
 
     if a.kind == "zip":
@@ -394,10 +444,12 @@ def apply_plan(plan: Plan, progress: Optional[Callable[[int, int], None]] = None
     batch_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     bdir = RECYCLE_DIR / batch_id
     records, problems = [], []
+    stopped_early = False
     total = len(plan.actions)
     for i, a in enumerate(plan.actions, 1):
         if _cancel.is_set():
             problems.append(f"Stopped early at your request: {total - i + 1} of {total} changes were not made.")
+            stopped_early = True
             break
         try:
             rec = _do(a, bdir)
@@ -418,10 +470,17 @@ def apply_plan(plan: Plan, progress: Optional[Callable[[int, int], None]] = None
               "recycle": str(bdir) if bdir.exists() else "",
               "open_path": str(plan.open_path) if plan.open_path and Path(plan.open_path).exists() else ""}
     if plan.after:
-        try:
-            plan.after(result)
-        except Exception as e:                       # a failed bookkeeping step must not hide the result
-            problems.append(f"(bookkeeping) {friendly(e)}")
+        if stopped_early:
+            # The follow-up step (e.g. saving the sync "last agreed" snapshot) must not
+            # record a half-applied batch as fully done, or the next run would see
+            # nothing to do and never finish the remaining changes.
+            problems.append("(bookkeeping) skipped because the run was stopped early - "
+                            "show the preview again to finish the remaining changes.")
+        else:
+            try:
+                plan.after(result)
+            except Exception as e:                   # a failed bookkeeping step must not hide the result
+                problems.append(f"(bookkeeping) {friendly(e)}")
     return result
 
 
@@ -448,9 +507,14 @@ def _undo_last(progress: Optional[Callable[[int, int], None]] = None) -> dict:
     bdir = RECYCLE_DIR / batch["id"]
     recs = list(reversed(batch["records"]))
     done, problems = 0, []
+    retry = bool(batch.get("partial"))
     for i, r in enumerate(recs, 1):                       # undo always finishes: a half-undone batch is worse
         src, dst = Path(r["src"]) if r["src"] else None, Path(r["dst"])
         label = dst.name
+        if r.get("restored"):                             # put back by an earlier attempt
+            if progress:
+                progress(i, len(recs))
+            continue
         try:
             if r["op"] in ("move", "trash"):
                 if not dst.exists():
@@ -488,14 +552,106 @@ def _undo_last(progress: Optional[Callable[[int, int], None]] = None) -> dict:
                         Path(d).rmdir()
                     except OSError:
                         pass
+            r["restored"] = True
             done += 1
         except Exception as e:
             problems.append(f"{label}: {friendly(e)}")
         if progress:
             progress(i, len(recs))
-    batch["undone"] = True
+    # A batch only counts as undone when everything was put back. Otherwise it stays on the list so the
+    # items that failed can be tried again. If a retry gets nowhere, stop offering it so older changes
+    # are not blocked, and say so.
+    gave_up = bool(problems) and retry and done == 0
+    batch["partial"] = bool(problems) and not gave_up
+    batch["undone"] = not problems or gave_up
+    if gave_up:
+        problems.append("These items could not be put back after a second try, so they were left as they are.")
     save_history(h)
-    return {"done": done, "problems": problems, "title": batch["title"]}
+    prune_empty_dirs(bdir)
+    return {"done": done, "problems": problems, "title": batch["title"], "partial": batch["partial"]}
+
+
+# --------------------------------------------------------------------------
+# Recycle folder hygiene
+# --------------------------------------------------------------------------
+def prune_empty_dirs(top: Path) -> None:
+    """Remove ``top`` and every folder inside it that is empty. A folder with anything in it stays."""
+    try:
+        for root, _dirs, _files in os.walk(top, topdown=False):
+            try:
+                os.rmdir(root)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _tree_size(top: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(top):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def recycle_usage() -> tuple:
+    """(number of backup batches, bytes used) in the Recycle folder."""
+    count, size = 0, 0
+    try:
+        with os.scandir(RECYCLE_DIR) as it:
+            entries = [e for e in it if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return 0, 0
+    for e in entries:
+        count += 1
+        size += _tree_size(Path(e.path))
+    return count, size
+
+
+ORPHAN_GRACE_SECONDS = 3600      # a batch folder this new may still be getting written to
+
+
+def cleanup_recycle() -> dict:
+    """Delete backups that Undo can no longer use.
+
+    Kept: batches that are not undone and are among the newest MAX_HISTORY.
+    Everything else in Recycle goes, then history entries for undone batches are dropped.
+    Returns {"removed": n, "freed": bytes, "kept": n, "problems": [..]}.
+    """
+    removed, freed, problems = 0, 0, []
+    with HISTORY_LOCK:
+        h = load_history()
+        keep = {b.get("id") for b in h[-MAX_HISTORY:] if not b.get("undone")}
+        known = {b.get("id") for b in h}
+        try:
+            with os.scandir(RECYCLE_DIR) as it:
+                dirs = [e for e in it if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            dirs = []
+        gone = set()
+        for e in dirs:
+            if e.name in keep:
+                continue
+            try:
+                if e.name not in known and time.time() - e.stat().st_mtime < ORPHAN_GRACE_SECONDS:
+                    continue
+            except OSError:
+                continue
+            size = _tree_size(Path(e.path))
+            shutil.rmtree(e.path, ignore_errors=True)
+            if os.path.exists(e.path):
+                problems.append(f"{e.name}: some files could not be deleted")
+                continue
+            removed, freed = removed + 1, freed + size
+            gone.add(e.name)
+        pruned = [b for b in h if not (b.get("undone") or b.get("id") in gone)]
+        if len(pruned) != len(h):
+            save_history(pruned)
+    kept = sum(1 for e in dirs if e.name in keep)
+    return {"removed": removed, "freed": freed, "kept": kept, "problems": problems}
 
 
 def describe_batch(b: dict) -> str:
@@ -503,7 +659,9 @@ def describe_batch(b: dict) -> str:
         when = datetime.fromisoformat(b["time"]).strftime("%b %d, %H:%M")
     except Exception:
         when = b.get("time", "")
-    return f"{b['title']} - {len(b['records'])} changes, {when}"
+    left = sum(1 for r in b["records"] if not r.get("restored"))
+    part = f" ({left} still to put back)" if b.get("partial") else ""
+    return f"{b['title']} - {len(b['records'])} changes, {when}{part}"
 
 
 # --------------------------------------------------------------------------

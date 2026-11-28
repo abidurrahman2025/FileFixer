@@ -84,6 +84,158 @@ class TestRename(Base):
         self.assertEqual(plan.actions, [])
 
 
+class TestWindowsNames(Base):
+    """Names Windows refuses are skipped one by one; they never block the valid renames."""
+
+    def plan_replace(self, text, text2):
+        return R["rename"].plan(defaults(R["rename"], folder=str(self.tmp), mode=recipes.R_MODES[2],
+                                         text=text, text2=text2))
+
+    def targets(self, plan):
+        return sorted(a.dst.name for a in plan.actions)
+
+    def test_trailing_dot_is_skipped(self):
+        self.make("a.txt"); self.make("grtxt.md")
+        plan = self.plan_replace("txt", "")
+        self.assertEqual(self.targets(plan), ["gr.md"])
+        self.assertTrue(any("1 file skipped because the new name isn't allowed on Windows" in n for n in plan.notes))
+
+    def test_trailing_space_is_skipped(self):
+        self.make("x y"); self.make("ay.md")
+        plan = self.plan_replace("y", "")
+        self.assertEqual(self.targets(plan), ["a.md"])
+        self.assertEqual(len(plan.notes), 1)
+
+    def test_reserved_device_names_are_skipped(self):
+        self.make("Z.txt"); self.make("Q5"); self.make("Q5.log"); self.make("Zoo.txt")
+        plan = self.plan_replace("Z", "CON")
+        self.assertEqual(self.targets(plan), ["CONoo.txt"])
+        self.assertTrue(any("1 file skipped" in n for n in plan.notes))
+        plan = self.plan_replace("Q", "com")
+        self.assertEqual(plan.actions, [])
+        self.assertTrue(any("2 files skipped" in n for n in plan.notes))
+
+    def test_valid_renames_still_apply(self):
+        self.make("Z.txt"); self.make("Zoo.txt")
+        self.run_recipe("rename", mode=recipes.R_MODES[2], text="Z", text2="CON")
+        self.assertEqual(self.names(), ["CONoo.txt", "Z.txt"])
+
+    def test_name_problem_helper(self):
+        for bad in ("report.", "report ", "CON", "con.txt", "Nul.tar.gz", "com5", "LPT9.txt", "aux .txt"):
+            self.assertIsNotNone(recipes.name_problem(bad), bad)
+        for good in ("console.txt", "com10.txt", "CONX", "a.b", ".hidden", "lpt0.txt"):
+            self.assertIsNone(recipes.name_problem(good), good)
+
+    def test_typed_output_names_are_refused(self):
+        self.make("a.txt"); self.make("b.txt")
+        for bad in ("nul", "CON.txt", "aux.log"):
+            with self.assertRaises(UserError):
+                R["merge"].plan(defaults(R["merge"], folder=str(self.tmp), out=bad))
+        with self.assertRaises(UserError):
+            R["package"].plan(defaults(R["package"], folder=str(self.tmp), outdir=str(self.tmp.parent), name="aux"))
+
+    def test_tidied_package_names_skip_bad_ones(self):
+        out = Path(tempfile.mkdtemp(prefix="ff_out_")).resolve()
+        self.make("CON.txt", "x"); self.make("fine.txt", "y")
+        plan = R["package"].plan(defaults(R["package"], folder=str(self.tmp), outdir=str(out), zip=False,
+                                          contents=False, naming=recipes.P_NAMING[1]))
+        self.assertEqual([a.dst.name for a in plan.actions], ["fine.txt"])
+        self.assertTrue(any("isn't allowed on Windows" in n for n in plan.notes))
+
+
+class TestRecycleHygiene(Base):
+    def batch_dirs(self):
+        return sorted(p.name for p in engine.RECYCLE_DIR.iterdir()) if engine.RECYCLE_DIR.exists() else []
+
+    def fake_batch(self, name, data=b"x" * 10, age_hours=48):
+        d = engine.RECYCLE_DIR / name / "removed"
+        d.mkdir(parents=True)
+        (d / "f.txt").write_bytes(data)
+        old = time.time() - age_hours * 3600
+        os.utime(engine.RECYCLE_DIR / name, (old, old))
+
+    def test_undo_removes_empty_batch_folder(self):
+        self.make("a.txt"); self.make("b.txt")
+        _, res = self.run_recipe("rename", mode=recipes.R_MODES[0], text="x_")
+        engine.undo_last()
+        self.assertFalse((engine.RECYCLE_DIR / res["batch"]).exists())
+
+    def test_undo_of_removal_leaves_no_empty_folders(self):
+        self.make("a.txt", "same"); self.make("b.txt", "same")
+        _, res = self.run_recipe("duplicates")
+        self.assertEqual(res["done"], 1)
+        self.assertEqual(len(self.names()), 1)
+        self.assertTrue((engine.RECYCLE_DIR / res["batch"]).exists())
+        engine.undo_last()
+        self.assertFalse((engine.RECYCLE_DIR / res["batch"]).exists())
+        self.assertEqual(self.names(), ["a.txt", "b.txt"])
+
+    def test_prune_keeps_folders_with_files(self):
+        d = engine.RECYCLE_DIR / "keepme" / "undone"
+        d.mkdir(parents=True)
+        (d / "f").write_text("x")
+        (engine.RECYCLE_DIR / "keepme" / "empty" / "deeper").mkdir(parents=True)
+        engine.prune_empty_dirs(engine.RECYCLE_DIR / "keepme")
+        self.assertTrue((d / "f").exists())
+        self.assertFalse((engine.RECYCLE_DIR / "keepme" / "empty").exists())
+
+    def test_usage_counts_batches_and_bytes(self):
+        self.assertEqual(engine.recycle_usage()[0], len(self.batch_dirs()))
+        before_n, before_b = engine.recycle_usage()
+        self.fake_batch("zz-usage1", b"y" * 100); self.fake_batch("zz-usage2", b"y" * 50)
+        n, b = engine.recycle_usage()
+        self.assertEqual((n - before_n, b - before_b), (2, 150))
+
+    def test_cleanup_keeps_referenced_batches_only(self):
+        for n in self.batch_dirs():
+            import shutil
+            shutil.rmtree(engine.RECYCLE_DIR / n)
+        for n in ("live", "undone1", "orphan", "newborn"):
+            self.fake_batch(n, age_hours=0.001 if n == "newborn" else 48)
+        rec = lambda: [{"op": "trash", "src": "a", "dst": "b"}]
+        engine.save_history([
+            {"id": "undone1", "title": "t", "time": "2026-01-01T00:00:00", "records": rec(), "undone": True},
+            {"id": "live", "title": "t", "time": "2026-01-02T00:00:00", "records": rec(), "undone": False},
+            {"id": "rename-only", "title": "t", "time": "2026-01-03T00:00:00", "records": rec(), "undone": False},
+        ])
+        out = engine.cleanup_recycle()
+        self.assertEqual(self.batch_dirs(), ["live", "newborn"])      # newborn: too new to be sure it is finished
+        self.assertEqual(out["removed"], 2)
+        self.assertEqual(out["freed"], 20)
+        self.assertEqual([b["id"] for b in engine.load_history()], ["live", "rename-only"])
+        self.assertEqual(engine.cleanup_recycle()["removed"], 0)       # nothing more to do
+
+
+class TestHonestUndo(Base):
+    def renamed(self):
+        self.make("a.txt", "A"); self.make("b.txt", "B")
+        self.run_recipe("rename", mode=recipes.R_MODES[0], text="x_")
+
+    def test_failed_restore_keeps_the_batch_and_retry_finishes_it(self):
+        self.renamed()
+        (self.tmp / "x_b.txt").unlink()                              # b can't be put back
+        out = engine.undo_last()
+        self.assertEqual((out["done"], len(out["problems"]), out["partial"]), (1, 1, True))
+        self.assertEqual(self.names(), ["a.txt"])
+        self.assertIsNotNone(engine.last_undoable())                 # not falsely reported as undone
+        self.assertIn("still to put back", engine.describe_batch(engine.last_undoable()))
+        (self.tmp / "x_b.txt").write_text("B")                       # cause fixed
+        out = engine.undo_last()
+        self.assertEqual((out["done"], out["problems"]), (1, []))
+        self.assertEqual(self.names(), ["a.txt", "b.txt"])
+        self.assertIsNone(engine.last_undoable())
+
+    def test_hopeless_retry_gives_up_so_older_changes_are_not_blocked(self):
+        self.make("old.txt"); self.run_recipe("rename", mode=recipes.R_MODES[0], text="o_")
+        self.renamed()
+        (self.tmp / "x_b.txt").unlink()
+        engine.undo_last()                                           # first try: partial
+        out = engine.undo_last()                                     # second try: no progress
+        self.assertTrue(out["problems"] and "second try" in out["problems"][-1])
+        self.assertEqual(engine.last_undoable()["title"], R["rename"].name)
+        self.assertIn("o_old.txt", self.names())                     # the older batch is next in line
+
+
 class TestOrganize(Base):
     def test_by_type_and_undo_removes_new_folders(self):
         self.make("p.JPG"); self.make("d.pdf"); self.make("weird.xyz"); self.make("song.mp3")
@@ -195,6 +347,13 @@ class TestMerge(Base):
         self.run_recipe("merge", headings=False)
         self.assertEqual(self.names(), ["a.txt", "b.txt", "combined (2).txt", "combined.txt"])
         self.assertEqual((self.tmp / "combined (2).txt").read_text().replace("\r\n", "\n"), "A\n\nB\n")
+
+    def test_output_name_is_left_out_in_subfolders_too(self):
+        self.make("a.txt", "A"); self.make("sub/b.txt", "B"); self.make("sub/combined.txt", "OLD")
+        plan, _ = self.run_recipe("merge", sub=True, headings=False)
+        self.assertNotIn("OLD", (self.tmp / "combined.txt").read_text())
+        self.assertEqual((self.tmp / "combined.txt").read_text().replace("\r\n", "\n"), "A\n\nB\n")
+        self.assertTrue((self.tmp / "sub" / "combined.txt").exists())      # and the old file is untouched
 
     def test_needs_two(self):
         self.make("a.txt")

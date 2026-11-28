@@ -33,6 +33,7 @@ STATE_FILE = engine.APP_DIR / "sync_state.json"
 CACHE_FILE = engine.APP_DIR / "hashcache.json"
 HEAVY_DIRS = {"node_modules", "$recycle.bin", "system volume information"}
 LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+MTIME_TIE_SECONDS = 2.0        # FAT/exFAT drives store times to 2 seconds
 
 
 def K(rel: str) -> str:
@@ -105,7 +106,8 @@ class Member:
             check_cancel()
             d, prefix = stack.pop()
             try:
-                entries = list(os.scandir(d))
+                with os.scandir(d) as it:
+                    entries = list(it)
             except OSError as e:
                 notes.append(f"Couldn't open {d}: {e.strerror or e}")
                 if d == self.path:
@@ -118,7 +120,7 @@ class Member:
                     continue
                 rel = prefix + name
                 try:
-                    if e.is_symlink():
+                    if e.is_symlink() or (engine.IS_WINDOWS and engine.is_junction_stat(e.stat(follow_symlinks=False))):
                         notes.append(f"Skipped a link (not followed): {self.path.name}/{rel}")
                     elif e.is_dir(follow_symlinks=False):
                         self.dirs[K(rel)] = rel
@@ -185,7 +187,9 @@ def find_groups(references: list, roots: list, skip: set, notes: list) -> list:
             check_cancel()
             d = stack.pop()
             try:
-                subs = sorted((e for e in os.scandir(d) if e.is_dir(follow_symlinks=False)), key=lambda e: e.name)
+                with os.scandir(d) as it:
+                    subs = sorted((e for e in it if e.is_dir(follow_symlinks=False) and not engine.is_link(e.path)),
+                                  key=lambda e: e.name)
             except OSError as e:
                 notes.append(f"Couldn't search inside {d}: {getattr(e, 'strerror', None) or e}")
                 continue
@@ -330,7 +334,10 @@ class Analysis:
 
 def _pick_winner(pres: list, key: str, rule: str, reference: Member) -> Optional[Member]:
     if rule == CONFLICT_RULES[1]:
-        return max(pres, key=lambda m: m.files[key][1])
+        ranked = sorted(pres, key=lambda m: m.files[key][1], reverse=True)
+        if len(ranked) > 1 and ranked[0].files[key][1] - ranked[1].files[key][1] <= MTIME_TIE_SECONDS:
+            return None            # too close to call (some drives only keep 2-second times): never guess
+        return ranked[0]
     if rule == CONFLICT_RULES[2] and reference in pres:
         return reference
     return None
@@ -478,6 +485,11 @@ def analyze(members: list, mode: str, base: dict, deletes: bool, rule: str) -> A
 def to_actions(an: Analysis, folder_label: Callable) -> list:
     order = {"mkdir": 0, "move": 1, "copy": 2, "update": 3, "trash": 4}
     acts = []
+
+    def seen(m: Member, key: str) -> tuple:
+        """(path, size, mtime) as the preview saw it."""
+        return (m.abs(key), m.files[key][0], m.files[key][1])
+
     for c in sorted(an.changes, key=lambda c: (order[c.kind], c.key)):
         d = c.dst
         if c.kind == "mkdir":
@@ -486,16 +498,18 @@ def to_actions(an: Analysis, folder_label: Callable) -> list:
         elif c.kind == "copy":
             rel = c.src.files[c.key][2]
             acts.append(Action("copy", f"[{c.src.label} → {d.label}] new file:  {rel}  ({size_text(c.src.files[c.key][0])})",
-                               c.src.abs(c.key), d.path / rel))
+                               c.src.abs(c.key), d.path / rel, guard=[seen(c.src, c.key), (d.path / rel, None, None)]))
         elif c.kind == "update":
             rel = d.files[c.key][2]
             acts.append(Action("overwrite", f"[{c.src.label} → {d.label}] replace with newer/chosen version:  {rel}   (old copy is backed up)",
-                               c.src.abs(c.key), d.abs(c.key)))
+                               c.src.abs(c.key), d.abs(c.key), guard=[seen(c.src, c.key), seen(d, c.key)]))
         elif c.kind == "move":
             old = d.files[c.key][2]
-            acts.append(Action("move", f"[{d.label}] rename:  {old}  →  {c.new_rel}", d.abs(c.key), d.path / c.new_rel))
+            acts.append(Action("move", f"[{d.label}] rename:  {old}  →  {c.new_rel}", d.abs(c.key), d.path / c.new_rel,
+                               guard=[seen(d, c.key)]))
         elif c.kind == "trash":
-            acts.append(Action("trash", f"[{d.label}] remove (to Recycle):  {d.files[c.key][2]}", d.abs(c.key)))
+            acts.append(Action("trash", f"[{d.label}] remove (to Recycle):  {d.files[c.key][2]}", d.abs(c.key),
+                               guard=[seen(d, c.key)]))
     return acts
 
 

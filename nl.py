@@ -66,7 +66,7 @@ def _days(t: str) -> Optional[str]:
 
 
 def _size_mb(t: str) -> Optional[str]:
-    m = re.search(r"(?:larger|bigger|greater|over|more|above)\s+than\s+(\d+(?:\.\d+)?)\s*(kb|mb|gb)", t)
+    m = re.search(r"(?:(?:larger|bigger|greater|more)\s+than|(?:over|above|at least))\s+(\d+(?:\.\d+)?)\s*(kb|mb|gb)", t)
     if not m:
         return None
     n = float(m.group(1)) * {"kb": 1 / 1024, "mb": 1, "gb": 1024}[m.group(2)]
@@ -102,15 +102,10 @@ class Context:
             for d in self.folders:
                 if (d / n).is_file():
                     return d / n
-        for n in names:                              # named but not found: remember the name for the message
-            self._unfound = n.strip()
         return None
 
     def one_file(self, text: str) -> Optional[Path]:
-        f = self.file_named(text)
-        if f:
-            return f
-        return self.files[0] if len(self.files) == 1 else (self.files[0] if self.files else None)
+        return self.file_named(text) or (self.files[0] if self.files else None)
 
     def one_folder(self) -> Optional[Path]:
         if self.folders:
@@ -200,10 +195,19 @@ def _extract_words(text, t, ctx):
     return i
 
 
+ADDRESS_NOUN = r"\b(emails?|e-mails?|email addresses|urls?|links?|web addresses|websites)\b"
+OTHER_VERBS = ("send", "write", "compose", "draft", "forward", "reply", "delete", "remove", "open", "rename", "sort",
+               "sync", "synchronize", "copy", "move", "split", "merge", "combine", "number")
+WHERE_TO_LOOK = r"\b(?:in|from|inside|within|of)\b.*\b(?:files?|folders?|directory|documents?|docs?|spreadsheets?|pdfs?|texts?|notes)\b"
+
+
 def _emails(text, t, ctx):
-    if not re.search(r"\b(emails?|e-mails?|email addresses|urls?|links?|web addresses|websites)\b", t) or \
-            not _has(t, "extract", "find", "get", "list", "collect", "pull", "grab", "show"):
+    if not re.search(ADDRESS_NOUN, t):
         return None
+    if not _has(t, "extract", "find", "get", "list", "collect", "pull", "grab", "show"):
+        # No asking-verb: "emails in this folder" still means collect them, but "send emails" does not.
+        if _has(t, *OTHER_VERBS) or not re.search(WHERE_TO_LOOK, t):
+            return None
     if _has(t, "files") and not _has(t, "address", "addresses", "emails", "email", "urls", "links"):
         return None
     is_url = bool(re.search(r"\b(urls?|links?|web addresses|websites)\b", t)) and not re.search(r"\bemail", t)
@@ -240,7 +244,8 @@ def _duplicates(text, t, ctx):
 
 
 def _rename(text, t, ctx):
-    if not re.search(r"\brename\b|\bchange (the )?(file )?names?\b|\bnumber (the )?files\b|\badd .* (to|in) (the )?(file )?names?\b", t):
+    if not re.search(r"\brename\b|\bchange (the )?(file )?names?\b|\bnumber (the )?files\b|\badd .* (to|in) (the )?(file )?names?\b"
+                     r"|\b(?:add|put|prepend|append)\b.*\b(?:start|beginning|front|end)\b.*\b(?:file )?names?\b", t):
         return None
     i = Intent("rename", {"sub": bool(re.search(r"subfolders|recursive|every folder|all folders", t))})
     _need_folder(i, ctx)
@@ -271,15 +276,18 @@ def _rename(text, t, ctx):
         i.values["mode"] = R.R_MODES[5]
         i.explain = "I will replace spaces in file names with underscores."
         return i
-    pre = re.search(r"\b(?:add|put|prepend)\s+(?:the\s+)?(?:prefix\s+)?(\"[^\"]+\"|[^\s\"]+)\s+(?:to|at|in)\s+(?:the\s+)?(?:start|beginning|front)", text, re.I)
-    suf = re.search(r"\b(?:add|put|append)\s+(?:the\s+)?(?:suffix\s+)?(\"[^\"]+\"|[^\s\"]+)\s+(?:to|at|in)\s+(?:the\s+)?end", text, re.I)
+    word = r"(\"[^\"]+\"|\u201c[^\u201d]+\u201d|'[^']+'|[^\s\"\u201c\u201d']+)"       # a quoted phrase (spaces allowed) or one word
+    pre = re.search(r"\b(?:add|put|prepend)\s+(?:the\s+)?(?:prefix\s+)?" + word + r"\s+(?:to|at|in)\s+(?:the\s+)?(?:start|beginning|front)", text, re.I)
+    suf = re.search(r"\b(?:add|put|append)\s+(?:the\s+)?(?:suffix\s+)?" + word + r"\s+(?:to|at|in)\s+(?:the\s+)?end", text, re.I)
     if pre:
-        i.values.update(mode=R.R_MODES[0], text=pre.group(1).strip('"'))
-        i.explain = f"I will add “{pre.group(1).strip(chr(34))}” to the start of each file name."
+        piece = pre.group(1).strip(Q)
+        i.values.update(mode=R.R_MODES[0], text=piece)
+        i.explain = f"I will add “{piece}” to the start of each file name."
         return i
     if suf:
-        i.values.update(mode=R.R_MODES[1], text=suf.group(1).strip('"'))
-        i.explain = f"I will add “{suf.group(1).strip(chr(34))}” to the end of each file name (before the .ext)."
+        piece = suf.group(1).strip(Q)
+        i.values.update(mode=R.R_MODES[1], text=piece)
+        i.explain = f"I will add “{piece}” to the end of each file name (before the .ext)."
         return i
     if containing:
         i.values.update(mode=R.R_MODES[2], only_name=containing, text=containing)
@@ -388,9 +396,14 @@ def _sync(text, t, ctx):
             i.values["folder"] = str(match[0])
             i.values["roots"] = "\n".join(sorted({str(f.parent) for f in folders}))
         elif folders:
-            hit = None
+            hit, looked = None, 0
             for r in folders:
                 for dp, dn, _ in os.walk(r):
+                    looked += 1
+                    if looked > 4000:                # this runs on the GUI thread: never walk forever
+                        i.notes.append("I stopped looking after 4000 folders - if it wasn't found, "
+                                       "pick the folder itself with “Choose folders”.")
+                        break
                     if any(d.lower() == name.lower() for d in dn):
                         hit = Path(dp) / next(d for d in dn if d.lower() == name.lower())
                         break

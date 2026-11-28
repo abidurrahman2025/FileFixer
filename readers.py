@@ -21,13 +21,25 @@ _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 
 
+MAX_PART_BYTES = 100 * 1024 * 1024      # biggest piece of a Word/Excel file we will unpack into memory
+
+
+def _part(z: zipfile.ZipFile, name: str) -> bytes:
+    """Read one piece of a zip file, refusing a piece that unpacks to something enormous (a zip bomb)."""
+    with z.open(name) as f:                       # KeyError if it is missing, like z.read
+        data = f.read(MAX_PART_BYTES + 1)
+    if len(data) > MAX_PART_BYTES:
+        raise UserError("This file unpacks to far more data than a normal document, so I won't open it.")
+    return data
+
+
 def is_document(p: Path) -> bool:
     return p.suffix.lower() in DOC_TYPES
 
 
 def _docx(p: Path) -> str:
     with zipfile.ZipFile(p) as z:
-        root = ET.fromstring(z.read("word/document.xml"))
+        root = ET.fromstring(_part(z, "word/document.xml"))
     paras = []
     for para in root.iter(_W + "p"):
         parts = []
@@ -43,36 +55,88 @@ def _docx(p: Path) -> str:
 
 
 def _col(ref: str) -> int:
+    """Column number (A = 1) of a cell reference like 'C7'. 0 when there are no letters in it."""
+    m = re.match(r"\$?([A-Za-z]+)", ref or "")
     n = 0
-    for ch in re.match(r"[A-Z]+", ref).group(0):
+    for ch in (m.group(1).upper() if m else ""):
         n = n * 26 + ord(ch) - 64
     return n
+
+
+_REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_PKG_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+
+def _xlsx_sheet_files(z: zipfile.ZipFile) -> list:
+    """[(sheet name, file inside the zip)] in the order the workbook shows its sheets.
+
+    Falls back to sheet1.xml, sheet2.xml ... (numeric order) if the workbook can't be understood.
+    """
+    names = set(z.namelist())
+    try:
+        wb = ET.fromstring(_part(z, "xl/workbook.xml"))
+        rels = {r.get("Id"): r.get("Target") for r in ET.fromstring(_part(z, "xl/_rels/workbook.xml.rels"))
+                if r.tag == _PKG_REL + "Relationship"}
+        found = []
+        for sh in wb.iter(_S + "sheet"):
+            target = rels.get(sh.get(_REL + "id"))
+            if not target:
+                continue
+            path = target.lstrip("/") if target.startswith("/") else "xl/" + target
+            path = re.sub(r"[^/]+/\.\./", "", path)
+            if path in names and "/worksheets/" in path:
+                found.append((sh.get("name") or Path(path).stem, path))
+        if found:
+            return found
+    except (KeyError, ET.ParseError, AttributeError):
+        pass
+    files = sorted((n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)),
+                   key=lambda n: int(re.findall(r"\d+", n)[0]))
+    return [(Path(n).stem, n) for n in files]
+
+
+def xlsx_sheet_names(p: Path) -> list:
+    """The real sheet names of a workbook, in workbook order."""
+    try:
+        with zipfile.ZipFile(p) as z:
+            return [name for name, _ in _xlsx_sheet_files(z)]
+    except (zipfile.BadZipFile, OSError):
+        return []
+
+
+def _cell_text(c, shared: list) -> str:
+    v = c.find(_S + "v")
+    t = c.get("t")
+    if t == "inlineStr":
+        return "".join(x.text or "" for x in c.iter(_S + "t"))
+    if t == "e" or v is None or v.text is None:
+        return ""                                  # error cells (#DIV/0! ...) and empty cells show as blank
+    if t == "s":
+        try:
+            return shared[int(v.text)]
+        except (ValueError, IndexError):
+            return ""
+    if t == "b":
+        return "TRUE" if v.text.strip() == "1" else "FALSE"
+    return v.text
 
 
 def _xlsx(p: Path) -> str:
     with zipfile.ZipFile(p) as z:
         shared = []
         if "xl/sharedStrings.xml" in z.namelist():
-            for si in ET.fromstring(z.read("xl/sharedStrings.xml")).iter(_S + "si"):
+            for si in ET.fromstring(_part(z, "xl/sharedStrings.xml")).iter(_S + "si"):
                 shared.append("".join(t.text or "" for t in si.iter(_S + "t")))
-        sheets = sorted((n for n in z.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)),
-                        key=lambda n: int(re.findall(r"\d+", n)[0]))
         out = []
-        for name in sheets:
-            for row in ET.fromstring(z.read(name)).iter(_S + "row"):
+        for _name, path in _xlsx_sheet_files(z):
+            for row in ET.fromstring(_part(z, path)).iter(_S + "row"):
                 cells, last = [], 0
                 for c in row.iter(_S + "c"):
-                    idx = _col(c.get("r", "A1"))
+                    # A cell with no usable reference goes right after the one before it.
+                    idx = max(_col(c.get("r", "")), last + 1)
                     cells += [""] * (idx - last - 1)
                     last = idx
-                    v = c.find(_S + "v")
-                    t = c.get("t")
-                    if t == "s" and v is not None:
-                        cells.append(shared[int(v.text)])
-                    elif t == "inlineStr":
-                        cells.append("".join(x.text or "" for x in c.iter(_S + "t")))
-                    else:
-                        cells.append(v.text if v is not None and v.text else "")
+                    cells.append(_cell_text(c, shared))
                 out.append("\t".join(cells))
     return "\n".join(out)
 

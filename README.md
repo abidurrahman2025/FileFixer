@@ -29,6 +29,24 @@ shows examples. Every request becomes one of the jobs below with visible setting
 
 Readable inputs: text files (any encoding), Word `.docx`, Excel `.xlsx`, PDF `.pdf` (with pypdf), `.csv/.tsv/.json`.
 
+### Names Windows won't accept
+Rename, Build a delivery package and the jobs that save a new file never create a name that ends with a dot or a space,
+or that is a name Windows keeps for itself (CON, PRN, AUX, NUL, COM1-9, LPT1-9, with or without an extension). A file whose new
+name would be refused is skipped and the preview says how many; the other files are still renamed. A name you type yourself
+for a new file or folder is refused with an explanation.
+
+### Safety checks while syncing
+Before changing a file, FileFixer checks that it still looks the way it did in the preview. If you edited it in the
+meantime, that one change is skipped and reported, and the rest still go through. New files are copied aside and moved into
+place, so an interrupted copy never leaves a half-written file. "Keep the newest version" only decides when one file is clearly
+newer (more than 2 seconds); otherwise it is shown as a conflict. Links and Windows junctions are never followed, and Word or
+Excel files that unpack to an enormous size are refused.
+
+### The Recycle folder
+Replaced and removed files are kept in `~/FileFixer/Recycle` so Undo can bring them back. The main window shows how much room
+it uses. **Clean up old backups...** deletes the copies Undo can no longer use (undone changes and anything older than your last
+50 changes) after asking you first. Changes you can still undo are always kept.
+
 ### Extract words
 Starts with / ends with / contains / is exactly / regular expression; several patterns at once; capitals matter or not;
 each word once or every time; **original order kept and complete words kept**. Punctuation is never altered unless you choose

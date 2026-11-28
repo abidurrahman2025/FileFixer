@@ -13,7 +13,7 @@ from typing import Iterator, Optional
 
 import readers
 from engine import (Action, Namer, NotText, Plan, UserError, check_file, check_folder, decode_bytes)
-from recipes import Field, Recipe, check_name_text, plural
+from recipes import Field, Recipe, check_new_name, plural
 
 HOW = ["Starts with", "Ends with", "Contains", "Is exactly", "Regular expression (advanced)"]
 SPLIT = ["Whitespace (spaces, tabs, line breaks)", "Each line is one item", "Only my own separators"]
@@ -166,9 +166,9 @@ class ExtractWords(Recipe):
             return plan
 
         name = v["outname"].strip() or f"{src.stem}List.txt"
-        check_name_text(name, "The file name")
         if not Path(name).suffix:
             name += ".txt"
+        check_new_name(name, "The file name")
         outdir = check_folder(v["outdir"]) if v["outdir"].strip() else src.parent
         dst = Namer().reserve(outdir / name)
         if dst.resolve() == src:

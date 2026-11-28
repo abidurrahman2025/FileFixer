@@ -64,6 +64,19 @@ def open_path(p) -> None:
         messagebox.showwarning("FileFixer", f"I couldn't open it:\n{p}\n\n{e}")
 
 
+def wheel(widget, scroll_fn, everywhere: bool = False) -> None:
+    """Make the mouse wheel call scroll_fn(units): -1 is up one step, 1 is down one step.
+
+    Windows and macOS send <MouseWheel>; Linux (X11) sends Button-4 (up) and Button-5 (down).
+    With everywhere=True the binding covers the whole app (bind_all), otherwise just this widget
+    and the widgets inside it.
+    """
+    bind = widget.bind_all if everywhere else widget.bind
+    bind("<MouseWheel>", lambda e: scroll_fn(-1 if e.delta > 0 else 1))
+    bind("<Button-4>", lambda e: scroll_fn(-1))
+    bind("<Button-5>", lambda e: scroll_fn(1))
+
+
 class ReviewDialog:
     """Lets the user tick or untick each individual change before anything happens."""
 
@@ -92,7 +105,10 @@ class ReviewDialog:
         inner = ttk.Frame(canvas)
         canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        # Wheel scrolling must NOT use bind_all: the binding would outlive this dialog
+        # (calling yview_scroll on a destroyed canvas) and double-scroll the main window.
+        # A binding on the Toplevel is in every child's bindtags and dies with the dialog.
+        wheel(self.top, lambda units: canvas.yview_scroll(units, "units"))
         self.vars = []
         for a in plan.actions:
             v = tk.BooleanVar(value=True)
@@ -166,7 +182,7 @@ class App:
 
         self._style()
         self._build()
-        root.bind_all("<MouseWheel>", self._wheel)
+        wheel(root, self._scroll_under_pointer, everywhere=True)
         self.sel_files, self.sel_folders = [], []
         self.show_home()
         self.refresh_undo()
@@ -232,7 +248,15 @@ class App:
         self.undo_label.pack(fill="x", padx=20, pady=(0, 10))
         tk.Button(bottom, text="Open the Recycle folder", anchor="w", relief="flat", bd=0, padx=20, pady=8,
                   bg=SIDEBAR_BG, fg="#8fa3b5", activebackground=SIDEBAR_HOVER, activeforeground="white",
-                  cursor="hand2", command=lambda: open_in_explorer(engine.RECYCLE_DIR)).pack(fill="x", pady=(0, 14))
+                  cursor="hand2", command=lambda: open_in_explorer(engine.RECYCLE_DIR)).pack(fill="x")
+        self.recycle_label = tk.Label(bottom, text="", bg=SIDEBAR_BG, fg="#8fa3b5", font=self.f_small,
+                                      wraplength=215, justify="left", anchor="w")
+        self.recycle_label.pack(fill="x", padx=20)
+        self.cleanup_btn = tk.Button(bottom, text="Clean up old backups...", anchor="w", relief="flat", bd=0, padx=20,
+                                     pady=6, bg=SIDEBAR_BG, fg="#8fa3b5", activebackground=SIDEBAR_HOVER,
+                                     activeforeground="white", disabledforeground="#586775", cursor="hand2",
+                                     command=self.on_cleanup)
+        self.cleanup_btn.pack(fill="x", pady=(0, 14))
 
         main = self.tool_frame = ttk.Frame(self.root, padding=(28, 22, 28, 12))
         self.title = ttk.Label(main, font=self.f_title)
@@ -495,7 +519,7 @@ class App:
         self.fcanvas.configure(scrollregion=self.fcanvas.bbox("all"),
                                height=min(self.form.winfo_reqheight(), self.max_form_h))
 
-    def _wheel(self, e) -> None:
+    def _scroll_under_pointer(self, units: int) -> None:
         """Mouse wheel scrolls the form when the pointer is over it (but not over a text box)."""
         try:
             w = self.root.winfo_containing(*self.root.winfo_pointerxy())
@@ -505,7 +529,7 @@ class App:
             return
         while w is not None:
             if w is self.fcanvas or w is self.side_canvas:
-                w.yview_scroll(-1 if e.delta > 0 else 1, "units")
+                w.yview_scroll(units, "units")
                 return
             w = w.master
 
@@ -635,6 +659,7 @@ class App:
         self.preview_btn.config(state=state)
         self.do_btn.config(state="disabled" if busy or self.plan is None or not self.plan.actions else "normal")
         self.undo_btn.config(state="disabled" if busy or not engine.last_undoable() else "normal")
+        self.cleanup_btn.config(state=state)
         self.status.config(text=text)
         if busy:
             self.cancel_btn.pack(side="right", padx=(0, 8))
@@ -679,6 +704,11 @@ class App:
                 elif msg[0] == "watchpending":
                     self.show_review_button()
                     self.root.bell()
+                elif msg[0] == "recycle":
+                    self._recycle_scanning = False
+                    self.recycle_label.config(text=(
+                        f"Recycle folder: {recipes.plural(msg[1], 'batch', 'batches')}, "
+                        f"{engine.size_text(msg[2])} on disk" if msg[1] else "Recycle folder: empty"))
                 elif msg[0] == "progress":
                     _, i, total = msg
                     if str(self.pb.cget("mode")) != "determinate":
@@ -893,6 +923,9 @@ class App:
         chunks = [(f"Undone:  {res['title']}  ({recipes.plural(res['done'], 'change')} reversed).\n", "good")]
         if res["problems"]:
             chunks.append((f"\n{recipes.plural(len(res['problems']), 'item')} could not be put back:\n", "bad"))
+            if res.get("partial"):
+                chunks.append(("Everything else was restored. Fix the cause (for example, close the file in "
+                               "another program) and click Undo again to retry the rest.\n", None))
             chunks += [(f"  {p}\n", None) for p in res["problems"][:100]]
         self.summary.config(text="Finished.")
         self.set_output(chunks)
@@ -902,6 +935,51 @@ class App:
         b = engine.last_undoable()
         self.undo_btn.config(state="normal" if b and not self.busy else "disabled")
         self.undo_label.config(text=engine.describe_batch(b) if b else "Nothing to undo yet.")
+        self.cleanup_btn.config(state="disabled" if self.busy else "normal")
+        self.refresh_recycle()
+
+    def refresh_recycle(self) -> None:
+        """Measure the Recycle folder in the background (it can hold many files)."""
+        if getattr(self, "_recycle_scanning", False):
+            return
+        self._recycle_scanning = True
+
+        def work():
+            try:
+                n, size = engine.recycle_usage()
+            except Exception:                                    # noqa: BLE001
+                n, size = 0, 0
+            self.q.put(("recycle", n, size))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_cleanup(self) -> None:
+        if self.busy:
+            return
+        if not messagebox.askyesno(
+                "Clean up old backups",
+                "This deletes the saved copies that \"Undo last change\" can no longer use: "
+                "changes you have already undone, and anything older than your last "
+                f"{engine.MAX_HISTORY} changes.\n\n"
+                "Changes you can still undo are kept. The files you are working on are not touched.\n\n"
+                "Clean up now?"):
+            return
+        self.run_bg(engine.cleanup_recycle, self.after_cleanup, "Cleaning up...")
+
+    def after_cleanup(self, res: dict) -> None:
+        if res["removed"]:
+            text = (f"Cleaned up {recipes.plural(res['removed'], 'old backup')} and freed "
+                    f"{engine.size_text(res['freed'])}.\n")
+        else:
+            text = "There was nothing to clean up. Every backup is still needed for Undo.\n"
+        chunks = [(text, "good")]
+        if res["problems"]:
+            chunks.append(("\nSome backups could not be deleted (they may be open in another program):\n", "bad"))
+            chunks += [(f"  {p}\n", None) for p in res["problems"][:50]]
+        self.summary.config(text="Finished.")
+        self.set_output(chunks)
+        engine.log_activity("done", "Clean up old backups", text.strip())
+        self.refresh_undo()
 
 
 def main() -> None:

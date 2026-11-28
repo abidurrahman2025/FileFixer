@@ -42,6 +42,8 @@ class AdvancedWindow:
         self.nb = ttk.Notebook(self.win)
         self.nb.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self.last_result = None
+        self._applying = False
+        self._batching = False
         self.script_inputs: list = []
         self.cancel_flag = threading.Event()
         self.steps: list = []
@@ -102,23 +104,38 @@ class AdvancedWindow:
         return frame, t
 
     def apply_and_report(self, plan: Plan, kind: str, name: str, payload=None) -> None:
-        """Confirm, apply through the engine (backup + undo) and log the run."""
+        """Confirm, apply through the engine (backup + undo) and log the run.
+
+        The apply itself runs on a background thread so the window stays responsive.
+        """
         if not plan.actions:
             messagebox.showinfo("FileFixer", plan.summary or "Nothing to do.", parent=self.win)
+            return
+        if getattr(self, "_applying", False):
+            messagebox.showinfo("FileFixer", "Still working on the previous change - please wait for it to finish.",
+                                parent=self.win)
             return
         lines = "\n".join(a.sentence for a in plan.actions[:12]) + (f"\n... and {len(plan.actions) - 12} more" if len(plan.actions) > 12 else "")
         notes = "\n".join(plan.notes)
         if not messagebox.askyesno("Ready to go?", f"{plan.summary}\n\n{lines}\n\n{notes}\n\nGo ahead? You can undo it afterwards.", parent=self.win):
             return
-        res = engine.apply_plan(plan)
-        status = "failed" if res["problems"] and not res["done"] else "ok"
-        W.log_run(kind, name, status, f"{res['done']} change(s)\n" + "\n".join(res["problems"]), payload)
-        engine.log_activity("failed" if status == "failed" else "done", name, f"{plural(res['done'], 'change')} made", res.get("open_path", ""))
-        self.app.refresh_undo()
-        msg = f"Done. {plural(res['done'], 'change')} made."
-        if res["problems"]:
-            msg += "\n\nProblems:\n" + "\n".join(res["problems"][:8])
-        messagebox.showinfo("FileFixer", msg, parent=self.win)
+        self._applying = True
+
+        def done(res, e) -> None:
+            self._applying = False
+            if e:
+                return self.err(e)
+            status = "failed" if res["problems"] and not res["done"] else "ok"
+            W.log_run(kind, name, status, f"{res['done']} change(s)\n" + "\n".join(res["problems"]), payload)
+            engine.log_activity("failed" if status == "failed" else "done", name, f"{plural(res['done'], 'change')} made",
+                                res.get("open_path", ""))
+            self.app.refresh_undo()
+            msg = f"Done. {plural(res['done'], 'change')} made."
+            if res["problems"]:
+                msg += "\n\nProblems:\n" + "\n".join(res["problems"][:8])
+            messagebox.showinfo("FileFixer", msg, parent=self.win)
+
+        self.bg(lambda: engine.apply_plan(plan), done)
 
     # ------------------------------------------------------------ 1. script
     def _script_tab(self) -> None:
@@ -544,8 +561,10 @@ class AdvancedWindow:
         self.batch_label.pack(anchor="w")
         bb = ttk.Frame(f)
         bb.pack(fill="x", pady=6)
-        ttk.Button(bb, text="Preview", command=self.batch_preview).pack(side="left")
-        ttk.Button(bb, text="Run batch", style="Big.TButton", command=self.batch_run).pack(side="left", padx=8)
+        self.batch_preview_btn = ttk.Button(bb, text="Preview", command=self.batch_preview)
+        self.batch_preview_btn.pack(side="left")
+        self.batch_run_btn = ttk.Button(bb, text="Run batch", style="Big.TButton", command=self.batch_run)
+        self.batch_run_btn.pack(side="left", padx=8)
         ttk.Button(bb, text="Clear files", command=lambda: (self.batch_files.clear(), self.batch_show())).pack(side="left")
         frame, self.batch_text = self.text_box(f, height=12)
         frame.pack(fill="both", expand=True)
@@ -578,33 +597,70 @@ class AdvancedWindow:
         name = self.batch_wf.get()
         return self.steps if name.startswith("(") else W.load_workflow(name)
 
-    def batch_plan(self) -> Plan:
+    def _batch_inputs(self) -> tuple:
+        """Read and check the form on the window's own thread; the result is safe to hand to a worker."""
         if not self.batch_files:
             raise UserError("Choose some files first.")
         if not self.batch_out.get().strip():
             raise UserError("Choose where to save the results.")
-        return W.batch_plan(self.batch_steps(), self.batch_files, self.batch_out.get(), self.batch_suffix.get())
+        return list(self.batch_steps()), list(self.batch_files), self.batch_out.get(), self.batch_suffix.get()
 
-    def batch_preview(self) -> None:
-        try:
-            plan = self.batch_plan()
-        except UserError as e:
-            return self.err(e)
-        lines = [plan.summary, ""] + plan.notes + [""] + [a.sentence for a in plan.actions[:300]]
+    def batch_plan(self) -> Plan:
+        """Build the plan right now. Reads every file, so the buttons use _batch_work instead."""
+        return W.batch_plan(*self._batch_inputs())
+
+    def _batch_set_text(self, text: str) -> None:
         self.batch_text.configure(state="normal")
         self.batch_text.delete("1.0", "end")
-        self.batch_text.insert("1.0", "\n".join(lines))
+        self.batch_text.insert("1.0", text)
         self.batch_text.configure(state="disabled")
 
-    def batch_run(self) -> None:
+    def _batch_work(self, then) -> None:
+        """Build the batch plan on a background thread, then call then(plan, inputs) back on the window's thread."""
+        if self._batching or self._applying:
+            messagebox.showinfo("FileFixer", "Still working on the previous step - please wait for it to finish.",
+                                parent=self.win)
+            return
         try:
-            plan = self.batch_plan()
-            steps = self.batch_steps()
+            inputs = self._batch_inputs()
         except UserError as e:
             return self.err(e)
-        self.apply_and_report(plan, "batch", f"Batch of {len(self.batch_files)} files",
-                              {"steps": steps, "files": list(self.batch_files), "outdir": self.batch_out.get(),
-                               "suffix": self.batch_suffix.get()})
+        self._batching = True
+        self.batch_preview_btn.config(state="disabled")
+        self.batch_run_btn.config(state="disabled")
+        self._batch_set_text("Looking at your files...")
+
+        def done(plan, e) -> None:
+            self._batching = False
+            try:
+                if not self.win.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            self.batch_preview_btn.config(state="normal")
+            self.batch_run_btn.config(state="normal")
+            if e:
+                self._batch_set_text("")
+                return self.err(e)
+            then(plan, inputs)
+
+        self.bg(lambda: W.batch_plan(*inputs), done)
+
+    def batch_preview(self) -> None:
+        def show(plan, _inputs) -> None:
+            lines = [plan.summary, ""] + plan.notes + [""] + [a.sentence for a in plan.actions[:300]]
+            self._batch_set_text("\n".join(lines))
+
+        self._batch_work(show)
+
+    def batch_run(self) -> None:
+        def go(plan, inputs) -> None:
+            steps, files, outdir, suffix = inputs
+            self._batch_set_text("")
+            self.apply_and_report(plan, "batch", f"Batch of {len(files)} files",
+                                  {"steps": steps, "files": files, "outdir": outdir, "suffix": suffix})
+
+        self._batch_work(go)
 
     # ------------------------------------------------------------ 5. history
     def _history_tab(self) -> None:
