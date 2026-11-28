@@ -1,4 +1,4 @@
-# FileFixer 2
+# FileFixer 2.1
 
 Describe what you want in plain English, or click a job. FileFixer shows exactly what will happen, asks
 before changing anything, backs up whatever it replaces, and can undo it. Needs only Python 3.13 (nothing to install;
@@ -27,7 +27,7 @@ shows examples. Every request becomes one of the jobs below with visible setting
 | Text | Extract words from a file · Extract emails and links · Find and replace · Clean up lines · Combine text files · Split a large text file |
 | Data | Work with a spreadsheet file (filter, columns, duplicates, sort, summarize, convert) · Combine spreadsheet files · Folder report |
 
-Readable inputs: text files (any encoding), Word `.docx`, Excel `.xlsx`, PDF `.pdf` (with pypdf), `.csv/.tsv/.json`.
+Readable inputs: text files (any encoding), Word `.docx`, Excel `.xlsx` (spreadsheet jobs use the first sheet), PDF `.pdf` (with pypdf), `.csv/.tsv/.json`.
 
 ### Names Windows won't accept
 Rename, Build a delivery package and the jobs that save a new file never create a name that ends with a dot or a space,
@@ -35,12 +35,22 @@ or that is a name Windows keeps for itself (CON, PRN, AUX, NUL, COM1-9, LPT1-9, 
 name would be refused is skipped and the preview says how many; the other files are still renamed. A name you type yourself
 for a new file or folder is refused with an explanation.
 
+### Safety checks on every job
+Before changing, moving or removing a file, FileFixer checks that it still looks the way it did in the preview. If you
+edited it in the meantime, that one change is skipped and reported, and the rest still go through. Duplicate removal also
+checks the copy that stays. Files swapped for shortcuts (links) and anything inside Windows or program folders are refused.
+New files are written beside their final place and moved in, so an interrupted save or copy never leaves a half-written
+file, and Undo restores edited files the same way.
+The undo list is written while a big job runs, so if the program or computer stops halfway, what was already done can still be undone.
+If a folder can't be opened (access denied, a disk error), the preview says so instead of quietly leaving files out.
+
 ### Safety checks while syncing
-Before changing a file, FileFixer checks that it still looks the way it did in the preview. If you edited it in the
-meantime, that one change is skipped and reported, and the rest still go through. New files are copied aside and moved into
-place, so an interrupted copy never leaves a half-written file. "Keep the newest version" only decides when one file is clearly
-newer (more than 2 seconds); otherwise it is shown as a conflict. Links and Windows junctions are never followed, and Word or
-Excel files that unpack to an enormous size are refused.
+New files are copied aside and moved into place. "Keep the newest version" only decides when one version is clearly newer
+(more than 2 seconds) and only between files that really changed since the last sync; otherwise it is shown as a conflict.
+A folder that has suddenly lost every file (an unplugged drive, an emptied folder) never makes FileFixer remove the other copies:
+deletions are switched off for that group and the preview says why. Links and Windows junctions are never followed, and
+Word or Excel files that unpack to an enormous size are refused. Watching re-checks every few seconds, but looks for new
+same-named folders only every two minutes, and leaves just-changed files, renames and removals for the next round.
 
 ### The Recycle folder
 Replaced and removed files are kept in `~/FileFixer/Recycle` so Undo can bring them back. The main window shows how much room
@@ -60,7 +70,7 @@ subfolders and conflicts. Conflicts are never decided silently (skip / keep newe
 **deletions are off unless you tick the box** and go to the Recycle folder. Symbolic links aren't followed; a folder never syncs
 with itself or one inside it. Modes: one-time, manual (tick each change), or continuous watching (asks first, or applies
 automatically). Continuous mode works while FileFixer is open and checks on a timer; files still being written are left for the next round.
-The first two-way sync can't know about earlier deletions (it has no history yet), so it only copies.
+The very first two-way sync can't know about earlier deletions (it has no history yet), so it only copies; folders that already match are remembered so later deletions are recognised.
 
 ## Advanced Tools (bottom of the sidebar)
 Python Script editor (restricted sandbox) · Regex Builder (live matches; extract/replace/remove on a file) · Workflow Builder
@@ -74,6 +84,15 @@ against hostile code. Memory limits are not available on Windows. FileFixer does
 ## Safety
 Preview first, confirm, atomic writes, backups to `C:\Users\<you>\FileFixer\Recycle`, undo for the last 50 batches, nothing
 permanently deleted, system folders refused, one failure never stops the rest, Cancel button during long work.
+
+## Tests
+```
+python tests.py            # jobs and engine
+python test_stages.py      # sync, watch, readers, parser, sandbox, workflows
+python test_hardening.py   # safety nets, atomic writes, sync edge cases, Windows names
+xvfb-run -a python3 test_gui.py   # window tests (needs Tkinter; Linux needs a display, Windows/macOS just run it)
+```
+All tests use temporary folders and a temporary `FILEFIXER_HOME`; they never touch real files.
 
 ## For developers
 `engine.py` (safe apply/undo/log) · `recipes.py`, `r_extract.py`, `r_sync.py`, `r_more.py` (jobs) · `registry.py` (grouping) ·

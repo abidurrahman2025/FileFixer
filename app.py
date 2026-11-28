@@ -24,6 +24,7 @@ from engine import UserError
 SIDEBAR_BG, SIDEBAR_FG, SIDEBAR_SEL, SIDEBAR_HOVER = "#17202a", "#ecf0f1", "#2e86c1", "#243342"
 MAX_PREVIEW_ACTIONS = 400
 SETTINGS_FILE = engine.APP_DIR / "settings.json"
+APP_VERSION = "2.1"
 
 
 def load_settings() -> dict:
@@ -35,8 +36,7 @@ def load_settings() -> dict:
 
 def save_settings(s: dict) -> None:
     try:
-        engine.APP_DIR.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(json.dumps(s), "utf-8")
+        engine.write_text_atomic(SETTINGS_FILE, json.dumps(s))
     except OSError:
         pass
 
@@ -163,7 +163,7 @@ class TextBoxVar:
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        root.title("FileFixer")
+        root.title(f"FileFixer {APP_VERSION}")
         screen_h = root.winfo_screenheight()
         height = min(860, screen_h - 90)
         root.geometry(f"1080x{height}")
@@ -180,6 +180,8 @@ class App:
         self.vars: dict = {}
         self.side_buttons: dict = {}
 
+        root.report_callback_exception = self._unexpected_error
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._style()
         self._build()
         wheel(root, self._scroll_under_pointer, everywhere=True)
@@ -187,6 +189,47 @@ class App:
         self.show_home()
         self.refresh_undo()
         self.poll()
+
+    # ------------------------------------------------------- safety nets
+    def _unexpected_error(self, exc, val, tb) -> None:
+        """Any error inside a button handler: save the details and explain calmly instead of failing silently."""
+        text = "".join(traceback.format_exception(exc, val, tb))
+        log = engine.APP_DIR / "error.log"
+        try:
+            engine.APP_DIR.mkdir(parents=True, exist_ok=True)
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}\n{text}\n")
+        except OSError:
+            pass
+        try:
+            messagebox.showerror("Something went wrong",
+                                 f"{val}\n\nNo harm done to your files. Technical details were saved to:\n{log}")
+        except tk.TclError:
+            pass
+
+    def on_close(self) -> None:
+        """Closing the window in the middle of work would leave a job half done, so stop it tidily first."""
+        if self.busy:
+            if not messagebox.askyesno("FileFixer is still working",
+                                       "A job is still running. Stop it and close FileFixer?\n\n"
+                                       "Changes already made can still be undone the next time you open it."):
+                return
+            engine.request_cancel()
+            deadline = datetime.now().timestamp() + 8
+            while self.busy_threads_alive() and datetime.now().timestamp() < deadline:
+                self.root.update()
+                self.root.after(50)
+        w = getattr(self, "watcher", None)
+        if w is not None:
+            w.stop()
+        try:
+            r_sync.HashCache.flush()
+        except Exception:                                        # noqa: BLE001
+            pass
+        self.root.destroy()
+
+    def busy_threads_alive(self) -> bool:
+        return any(t.name == "ff-worker" and t.is_alive() for t in threading.enumerate())
 
     # ------------------------------------------------------------------ look
     def _style(self) -> None:
@@ -455,7 +498,13 @@ class App:
         if not text:
             self.cmd_msg.config(text="Type what you want to do first, or pick one of the examples below.")
             return
-        intent = nl.interpret(text, self.sel_files, self.sel_folders)
+        if self.busy:
+            return
+        files, folders = list(self.sel_files), list(self.sel_folders)
+        # Understanding a request may look through folders, so it never runs on the window's own thread.
+        self.run_bg(lambda: nl.interpret(text, files, folders), self.after_command, "Reading your request...")
+
+    def after_command(self, intent) -> None:
         if intent is None:
             self.cmd_msg.config(text=nl.HELP)
             return
@@ -681,7 +730,7 @@ class App:
                 res = ("err", e, traceback.format_exc())
             self.q.put(("done", done, res))
 
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work, daemon=True, name="ff-worker").start()
 
     def report_progress(self, i: int, total: int) -> None:
         self.q.put(("progress", i, total))
@@ -866,8 +915,11 @@ class App:
             chosen = ReviewDialog(self.root, plan).show()
             if chosen is None:
                 return
-            plan.actions = chosen
-            plan.summary = f"{recipes.plural(len(chosen), 'change')} you approved will be made."
+            if not chosen:
+                self.summary.config(text="No changes were ticked, so nothing was done.")
+                return
+            from dataclasses import replace
+            plan = replace(plan, actions=chosen, summary=f"{recipes.plural(len(chosen), 'change')} you approved will be made.")
         if not messagebox.askyesno(
                 "Ready to go?",
                 f"{plan.title}\n\n{plan.summary}\n\nNothing is permanently deleted, and you can undo this "

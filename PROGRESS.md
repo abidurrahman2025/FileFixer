@@ -21,3 +21,5 @@ New modules: `registry.py` (all jobs, grouped), `r_extract.py`, `r_sync.py`, `r_
 Notes for resuming: S5 = `nl.py` (rule-based parser -> Intent(key, values, explain, missing)), Home view in `app.py`
 (command box, Choose files/folders, quick actions, recent activity from `engine.log_activity` -> activity.json).
 S6 = `sandbox.py` (python -I subprocess + audit-hook guard, scratch dir, timeout, rlimits), `advanced.py` (window with tabs).
+
+- [x] S8 Hardening pass (v2.1): auto preview guards on every change, atomic write/undo, crash-safe undo journal, sync conflict/rename/baseline fixes, unreadable-folder warnings, background request parsing, `test_hardening.py`

@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from engine import (check_cancel, Action, Namer, NotText, Plan, UserError, check_folder, decode_bytes,
+from engine import (check_cancel, watch_file, Action, Namer, NotText, Plan, UserError, check_folder, decode_bytes,
                     list_files, looks_like_text, norm, parse_exts, size_text)
 
 
@@ -90,6 +90,29 @@ def check_new_name(name: str, what: str) -> None:
                         "(Windows doesn't allow that in file names. Please choose a different name.)")
 
 
+def with_extension(name: str, default_ext: str) -> str:
+    """Add the default extension unless the name already ends in a real one.
+
+    "notes" -> "notes.txt", "notes.csv" stays, but "v1.2" or "Report. final" are not extensions, so they
+    become "v1.2.txt" / "Report. final.txt" instead of being saved with no useful type.
+    """
+    ext = Path(name).suffix
+    if re.fullmatch(r"\.[A-Za-z][A-Za-z0-9]{0,7}", ext):
+        return name
+    return name + default_ext
+
+
+def note_problems(plan: Plan, problems: list, what: str = "The result") -> None:
+    """Tell the user, in the preview, about places that could not be read."""
+    if not problems:
+        return
+    shown = problems[:5]
+    plan.notes.append(f"{plural(len(problems), 'place')} could not be read, so {what.lower()} may be incomplete:")
+    plan.notes += [f"    {x}" for x in shown]
+    if len(problems) > len(shown):
+        plan.notes.append(f"    ... and {len(problems) - len(shown)} more")
+
+
 def natural_key(name: str) -> list:
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name.lower())]
 
@@ -141,7 +164,8 @@ class BulkRename(Recipe):
         check_name_text(text, "The text")
         check_name_text(text2, "The replacement text")
 
-        files = list_files(folder, v["sub"], parse_exts(v["only"]))
+        problems: list = []
+        files = list_files(folder, v["sub"], parse_exts(v["only"]), problems)
         if v.get("only_name", "").strip():
             files = [p for p in files if v["only_name"].strip().lower() in p.name.lower()]
         if mode == R_MODES[3]:
@@ -195,6 +219,7 @@ class BulkRename(Recipe):
             plan.notes.append(f"{plural(bad_names, 'file')} skipped because the new name isn't allowed on Windows.")
         if not files:
             plan.notes.append("No matching files were found in that folder.")
+        note_problems(plan, problems)
         return plan
 
 
@@ -231,7 +256,8 @@ class Organize(Recipe):
 
     def plan(self, v):
         folder = check_folder(v["folder"])
-        files = list_files(folder, v["sub"])
+        problems: list = []
+        files = list_files(folder, v["sub"], None, problems)
         if str(v.get("days", "")).strip():
             try:
                 cutoff = datetime.now().timestamp() - float(v["days"]) * 86400
@@ -239,7 +265,7 @@ class Organize(Recipe):
                 raise UserError("“Only files changed in the last” needs a number, like 30.")
             files = [p for p in files if p.stat().st_mtime >= cutoff]
         plan = Plan(self.name)
-        namer, in_place, dest_folders = Namer(), 0, set()
+        namer, in_place, dest_folders, bad_names = Namer(), 0, set(), 0
         for p in files:
             cat = EXT_TO_CAT.get(p.suffix.lower(), "Other")
             month = f"{datetime.fromtimestamp(p.stat().st_mtime):%Y-%m}"
@@ -254,6 +280,9 @@ class Organize(Recipe):
             if norm(p.parent) == norm(target):
                 in_place += 1
                 continue
+            if any(name_problem(part) for part in target.relative_to(folder).parts):
+                bad_names += 1                      # e.g. a file ending in ".con" would need a folder called CON
+                continue
             dst = namer.reserve(target / p.name)
             dest_folders.add(target)
             plan.actions.append(Action("move", f"{rel(p, folder)}   →   {rel(target, folder)}{os.sep}", p, dst))
@@ -262,8 +291,12 @@ class Organize(Recipe):
                         if n else "Nothing to move - everything is already sorted.")
         if in_place and n:
             plan.notes.append(f"{plural(in_place, 'file')} are already in the right place.")
+        if bad_names:
+            plan.notes.append(f"{plural(bad_names, 'file')} skipped because the folder it would go into "
+                              "isn't allowed on Windows.")
         if not files:
             plan.notes.append("No files were found in that folder.")
+        note_problems(plan, problems)
         return plan
 
 
@@ -298,7 +331,8 @@ class FindReplace(Recipe):
 
         plan = Plan(self.name)
         total, binary, big = 0, 0, 0
-        for p in list_files(folder, v["sub"], parse_exts(v["types"])):
+        problems: list = []
+        for p in list_files(folder, v["sub"], parse_exts(v["types"]), problems):
             try:
                 if p.stat().st_size > 100 * 1024 * 1024:
                     big += 1
@@ -334,6 +368,7 @@ class FindReplace(Recipe):
             plan.notes.append(f"{plural(binary, 'file')} skipped because they aren't plain text (pictures, programs, ...).")
         if big:
             plan.notes.append(f"{plural(big, 'file')} skipped because they are over 100 MB.")
+        note_problems(plan, problems)
         return plan
 
 
@@ -408,11 +443,12 @@ class Duplicates(Recipe):
 
     def plan(self, v):
         folder = check_folder(v["folder"])
-        files = list_files(folder, v["sub"])
+        problems: list = []
+        files = list_files(folder, v["sub"], None, problems)
         seen = {norm(p) for p in files}
         for extra in str(v.get("more", "")).replace(";", "\n").splitlines():
             if extra.strip():
-                for p in list_files(check_folder(extra), v["sub"]):
+                for p in list_files(check_folder(extra), v["sub"], None, problems):
                     if norm(p) not in seen:
                         seen.add(norm(p))
                         files.append(p)
@@ -431,8 +467,11 @@ class Duplicates(Recipe):
             groups += 1
             for d in rest:
                 extra_bytes += keeper.stat().st_size
+                # Both the extra copy and the copy that stays must be unchanged when the move happens,
+                # or the "extra" copy might no longer be a copy.
                 plan.actions.append(Action(
-                    "trash", f"{rel(d, folder)}   is a copy of   {rel(keeper, folder)}", d))
+                    "trash", f"{rel(d, folder)}   is a copy of   {rel(keeper, folder)}", d,
+                    guard=[watch_file(keeper)]))
         n = len(plan.actions)
         plan.actions.sort(key=lambda a: str(a.src).lower())
         plan.summary = (f"Found {plural(groups, 'set')} of identical files. {plural(n, 'extra copy', 'extra copies')} "
@@ -440,6 +479,7 @@ class Duplicates(Recipe):
                         if n else "No duplicate files were found.")
         if unreadable:
             plan.notes.append(f"{plural(unreadable, 'file')} couldn't be read and were skipped.")
+        note_problems(plan, problems, "the list of copies")
         return plan
 
 
@@ -475,7 +515,8 @@ class MergeText(Recipe):
         # A file with the output's name is left out at any depth, so an old combined.txt
         # inside a subfolder is never merged into the new one.
         out_key = norm(out_name)
-        files = [p for p in list_files(folder, v["sub"], parse_exts(v["types"]))
+        problems: list = []
+        files = [p for p in list_files(folder, v["sub"], parse_exts(v["types"]), problems)
                  if norm(p.name) != out_key]
         not_text = [p for p in files if not looks_like_text(p)]
         files = [p for p in files if p not in not_text]
@@ -485,6 +526,7 @@ class MergeText(Recipe):
             files.sort(key=lambda p: p.stat().st_mtime, reverse=v["order"] == M_ORDERS[2])
 
         plan = Plan(self.name)
+        note_problems(plan, problems)
         if not_text:
             plan.notes.append(f"{plural(len(not_text), 'file')} skipped because they aren't plain text.")
         if len(files) < 2:
@@ -624,7 +666,8 @@ class DeliveryPackage(Recipe):
             raise UserError("The package can't be saved inside the folder you are packaging.\n"
                             "Choose a different place in the 'Save it in' box.")
 
-        files = list_files(folder, v["sub"])
+        problems: list = []
+        files = list_files(folder, v["sub"], None, problems)
         junk = 0
         if v["junk"]:
             kept = [p for p in files if p.suffix.lower() not in JUNK_EXTS and not p.name.endswith("~")]
@@ -640,6 +683,7 @@ class DeliveryPackage(Recipe):
             dupes = len(drop)
 
         plan = Plan(self.name)
+        note_problems(plan, problems)
         if not files:
             plan.summary = "There are no files to package."
             return plan

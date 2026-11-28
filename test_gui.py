@@ -138,6 +138,7 @@ class TestWindow(unittest.TestCase):
         self.assertTrue(any("done" in str(self.app.activity.item(i)["values"]).lower() or "Done" in str(self.app.activity.item(i)["values"])
                             for i in self.app.activity.get_children()))
         self.app.use_suggestion("what is the weather"); self.app.on_command()
+        self.pump(lambda: "couldn't match" in self.app.cmd_msg.cget("text"))
         self.assertIn("couldn't match", self.app.cmd_msg.cget("text"))
 
     def test_review_dialog_selects_individual_changes(self):

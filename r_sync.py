@@ -330,14 +330,24 @@ class Analysis:
     changes: list = field(default_factory=list)
     conflicts: list = field(default_factory=list)       # (key, [(member, hash)])
     skipped_deletes: list = field(default_factory=list)  # (key, [members that deleted it])
+    deletes_blocked: list = field(default_factory=list)  # labels of folders that look wiped out or unplugged
 
 
-def _pick_winner(pres: list, key: str, rule: str, reference: Member) -> Optional[Member]:
+def _pick_winner(pres: list, key: str, rule: str, reference: Member, hashes: Optional[dict] = None) -> Optional[Member]:
+    """Choose which version wins a conflict, or None when it can't be decided safely.
+
+    `pres` should be only the folders whose version really competes (changed since the last sync).
+    `hashes` (member -> content hash) lets two folders that hold identical text count as one version.
+    """
     if rule == CONFLICT_RULES[1]:
         ranked = sorted(pres, key=lambda m: m.files[key][1], reverse=True)
-        if len(ranked) > 1 and ranked[0].files[key][1] - ranked[1].files[key][1] <= MTIME_TIE_SECONDS:
+        if not ranked:
+            return None
+        top = ranked[0]
+        rivals = [m for m in ranked[1:] if hashes is None or hashes.get(m) != hashes.get(top)]
+        if rivals and top.files[key][1] - rivals[0].files[key][1] <= MTIME_TIE_SECONDS:
             return None            # too close to call (some drives only keep 2-second times): never guess
-        return ranked[0]
+        return top
     if rule == CONFLICT_RULES[2] and reference in pres:
         return reference
     return None
@@ -348,6 +358,16 @@ def analyze(members: list, mode: str, base: dict, deletes: bool, rule: str) -> A
     ref = members[0]
     two_way = mode == SYNC_MODES[1]
     handled: set = set()                                   # (member label, key) already dealt with
+    if deletes:
+        # A folder that has suddenly lost everything (unplugged drive, emptied by mistake) must not
+        # make FileFixer remove every other copy. Deletions stay off for that group, and we say so.
+        if two_way:
+            wiped = [m for m in members if not m.files and len(base) >= 2]
+        else:
+            wiped = [ref] if not ref.files and any(len(m.files) >= 2 for m in members[1:]) else []
+        if wiped:
+            out.deletes_blocked = [m.label for m in wiped]
+            deletes = False
 
     def add(kind, dst, key, src=None, new_key=None, new_rel=None):
         out.changes.append(Change(kind, dst, key, src, new_key, new_rel))
@@ -360,6 +380,8 @@ def analyze(members: list, mode: str, base: dict, deletes: bool, rule: str) -> A
     if two_way:
         for i in members:
             gone = {k: base[k] for k in base if k not in i.files and K(k) == k}
+            if not gone:
+                continue                       # nothing disappeared here, so nothing can have been renamed
             new = [k for k in i.files if k not in base]
             by_hash: dict = {}
             for k in new:
@@ -373,7 +395,7 @@ def analyze(members: list, mode: str, base: dict, deletes: bool, rule: str) -> A
                 if all(old in m.files and m.h(old) == bh and nk not in m.files for m in others):
                     for m in others:
                         add("move", m, old, new_key=nk, new_rel=i.files[nk][2])
-                    handled |= {old, nk}
+                    handled |= {(m.label, k) for m in members for k in (old, nk)}
     else:
         for d in members[1:]:
             s_only = [k for k in ref.files if k not in d.files]
@@ -414,7 +436,11 @@ def analyze(members: list, mode: str, base: dict, deletes: bool, rule: str) -> A
             union |= set(m.files)
         for k in sorted(union):
             check_cancel()
-            if k in handled:
+            if any((m.label, k) in handled for m in members):
+                continue
+            have = [m for m in members if k in m.files]
+            if (base.get(k) is None and rule == CONFLICT_RULES[0] and len({m.files[k][0] for m in have}) > 1):
+                out.conflicts.append((k, [(m, None) for m in members]))      # sizes differ: no need to read the files
                 continue
             cur = {m: m.h(k) for m in members}
             present = {m: h for m, h in cur.items() if h is not None}
@@ -447,7 +473,10 @@ def analyze(members: list, mode: str, base: dict, deletes: bool, rule: str) -> A
                     continue
                 conflict = True
             if conflict:
-                win = _pick_winner(list(present), k, rule, ref) if present else None
+                # Only versions that changed since the last sync compete. A folder that still holds the old
+                # content must never win just because its file happens to carry a newer timestamp.
+                rivals = [m for m in present if b is None or present[m] != b] or list(present)
+                win = _pick_winner(rivals, k, rule, ref, present) if present else None
                 if win is None:
                     out.conflicts.append((k, list(cur.items())))
                 else:
@@ -458,13 +487,16 @@ def analyze(members: list, mode: str, base: dict, deletes: bool, rule: str) -> A
                 check_cancel()
                 if (d.label, k) in handled:
                     continue
-                sh, dh = ref.h(k), d.h(k)
-                if sh == dh:
-                    continue
-                if dh is None:
+                if k not in d.files:
                     add("copy", d, k, ref)
                     continue
                 b = base.get(k)
+                if b is None and ref.files[k][0] != d.files[k][0]:
+                    add("update", d, k, ref)               # different sizes: certainly different, no need to read them
+                    continue
+                sh, dh = ref.h(k), d.h(k)
+                if sh == dh:
+                    continue
                 if b is not None and sh != b and dh != b:         # both sides changed since the last sync
                     win = _pick_winner([ref, d], k, rule, ref)
                     if win is None:
@@ -519,6 +551,8 @@ class SyncPlanner:
     def __init__(self, v: dict) -> None:
         self.v = v
         self.skip = {s.strip().lower() for s in str(v.get("skip", "")).replace(";", ",").split(",") if s.strip()}
+        self.cached_groups: Optional[list] = None      # the watcher re-uses these instead of searching every round
+        self.last_groups: Optional[list] = None
 
     def references(self) -> list:
         refs = [check_folder(self.v["folder"])]
@@ -534,7 +568,12 @@ class SyncPlanner:
         return roots
 
     def groups(self, notes: list) -> list:
-        return find_groups(self.references(), self.roots(), self.skip, notes)
+        if self.cached_groups is not None:
+            self.references()                           # still check the reference folders are valid
+            self.last_groups = self.cached_groups
+        else:
+            self.last_groups = find_groups(self.references(), self.roots(), self.skip, notes)
+        return self.last_groups
 
     def build(self, compare_only: bool) -> Plan:
         plan = Plan("Compare folders" if compare_only else "Synchronize folders")
@@ -576,8 +615,20 @@ class SyncPlanner:
             for k, who in an.skipped_deletes[:50]:
                 orig = next((m.files[k][2] for m in members if k in m.files), k)
                 plan.report.append(f"     Not removed (deletions are off):  {orig}")
+            if an.deletes_blocked:
+                who = " and ".join(an.deletes_blocked)
+                plan.report.append(f"     Deletions were switched off for this group: {who} has no files at all "
+                                   "(an unplugged drive or an emptied folder?). Nothing was removed anywhere.")
+                plan.notes.append(f"“{name}”: removing files was skipped because a folder looks empty by accident.")
             plan.report.append("")
             plan.after = self._remember(plan.after, key, paths)
+            if not acts and not an.conflicts and not an.skipped_deletes and key not in load_state():
+                # Already in step and never synced before: remember that, so a file deleted later
+                # is recognised as a deletion and not mistaken for a brand-new file somewhere else.
+                try:
+                    save_state(key, snapshot(paths, self.skip, {}), paths)
+                except OSError:
+                    pass
         plan.selectable = bool(self.v.get("review", True)) and not compare_only
         HashCache.flush()
         if compare_only:
@@ -652,6 +703,7 @@ class SyncFolders(Recipe):
 # --------------------------------------------------------------------------
 WATCH_INTERVALS = {"Every 10 seconds": 10, "Every 30 seconds": 30, "Every minute": 60, "Every 5 minutes": 300}
 WATCH_ACTION = ["Ask me before applying changes", "Apply changes automatically"]
+REDISCOVER_SECONDS = 120      # how often the watcher looks again for new same-named folders
 
 
 class SyncWatcher:
@@ -672,6 +724,8 @@ class SyncWatcher:
         self._seen_conflicts: set = set()
         self.pending: Optional[Plan] = None
         self.cycles = 0
+        self._groups: Optional[list] = None
+        self._groups_time = 0.0
 
     @property
     def running(self) -> bool:
@@ -687,14 +741,20 @@ class SyncWatcher:
 
     def _unsettled(self, a: Action, now: float) -> bool:
         try:
-            return a.src is not None and a.kind in ("copy", "overwrite") and now - a.src.stat().st_mtime < self.settle
+            return a.src is not None and now - a.src.stat().st_mtime < self.settle
         except OSError:
             return True
 
     def check_once(self) -> Optional[Plan]:
         """One round.  Returns the plan that was applied or is waiting (None if nothing to do)."""
         with self.lock:
-            plan = SyncPlanner(self.v).build(compare_only=False)
+            planner = SyncPlanner(self.v)
+            now = time.time()
+            if self._groups is not None and now - self._groups_time < REDISCOVER_SECONDS:
+                planner.cached_groups = self._groups       # the search places haven't been walked again this round
+            plan = planner.build(compare_only=False)
+            if planner.cached_groups is None:
+                self._groups, self._groups_time = planner.last_groups, now
             self.cycles += 1
             conflicts = {ln.strip() for ln in plan.report if "CONFLICT" in ln}
             for c in sorted(conflicts - self._seen_conflicts):

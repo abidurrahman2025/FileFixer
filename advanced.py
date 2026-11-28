@@ -5,7 +5,6 @@ process from sandbox.py, and file results are written through engine plans (prev
 """
 from __future__ import annotations
 
-import json
 import os
 import threading
 import tkinter as tk

@@ -784,7 +784,7 @@ class TestXlsxReader(Base):
                                     '<row><c t="inlineStr"><is><t>Ann</t></is></c></row>'},
                       order=[("People", 2), ("Misc", 1)])
         head, rows, _, _ = r_more.read_table(p)
-        self.assertEqual((head, rows), (["name"], [["Ann"], ["other"]]))
+        self.assertEqual((head, rows), (["name"], [["Ann"]]))           # only the first sheet is the table
 
 
 class FakeText:

@@ -121,7 +121,8 @@ def _cell_text(c, shared: list) -> str:
     return v.text
 
 
-def _xlsx(p: Path) -> str:
+def xlsx_rows(p: Path, first_sheet_only: bool = False) -> list:
+    """The cells of a workbook as a list of rows (each a list of text), sheets in workbook order."""
     with zipfile.ZipFile(p) as z:
         shared = []
         if "xl/sharedStrings.xml" in z.namelist():
@@ -137,8 +138,15 @@ def _xlsx(p: Path) -> str:
                     cells += [""] * (idx - last - 1)
                     last = idx
                     cells.append(_cell_text(c, shared))
-                out.append("\t".join(cells))
-    return "\n".join(out)
+                out.append(cells)
+            if first_sheet_only:
+                break
+    return out
+
+
+def _xlsx(p: Path) -> str:
+    # Tabs and line breaks inside a cell would break the row/column layout of the text, so they become spaces.
+    return "\n".join("\t".join(re.sub(r"[\t\r\n]+", " ", c) for c in row) for row in xlsx_rows(p))
 
 
 def _pdf(p: Path) -> str:

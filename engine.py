@@ -74,6 +74,23 @@ class Action:
     # If anything has changed by the time the action runs, it is refused instead of acting on stale information.
     guard: list = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        # Every change that acts on an existing file remembers how that file looked when the preview was made.
+        # (Sync plans and the duplicate finder add more files to guard; those are kept.)
+        if self.kind in ("move", "trash", "edit") and self.src is not None \
+                and not any(norm(g[0]) == norm(self.src) for g in self.guard):
+            try:
+                st = os.lstat(self.src)
+                self.guard = list(self.guard) + [(self.src, st.st_size, st.st_mtime)]
+            except OSError:
+                pass
+
+
+def watch_file(path) -> tuple:
+    """(path, size, mtime) for Action.guard: the file must still look like this when the change runs."""
+    st = os.lstat(path)
+    return (path, st.st_size, st.st_mtime)
+
 
 @dataclass
 class Plan:
@@ -94,7 +111,19 @@ def norm(p) -> str:
     return os.path.normcase(str(p))
 
 
+_PROTECTED_CACHE: dict = {}
+
+
 def _protected_dirs() -> list:
+    envkey = tuple(os.environ.get(v) for v in ("SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)",
+                                                "ProgramW6432", "ProgramData"))
+    if envkey not in _PROTECTED_CACHE:
+        _PROTECTED_CACHE.clear()
+        _PROTECTED_CACHE[envkey] = _protected_dirs_uncached()
+    return _PROTECTED_CACHE[envkey]
+
+
+def _protected_dirs_uncached() -> list:
     dirs = []
     for var in ("SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)",
                 "ProgramW6432", "ProgramData"):
@@ -119,18 +148,45 @@ def check_folder(text) -> Path:
     p = p.resolve()
     if p == Path(p.anchor):
         raise UserError("Please choose a specific folder, not a whole drive.")
+    try:
+        if p == Path.home().resolve():
+            raise UserError("That is your whole user folder, which holds everything of yours. "
+                            "Please choose a folder inside it (Documents, Downloads, Pictures ...).")
+    except (OSError, RuntimeError):
+        pass
+    if in_protected_dir(p):
+        raise UserError("That folder belongs to your computer's system, so FileFixer won't touch it.\n"
+                        "Please choose one of your own folders (Documents, Downloads, ...).")
+    app = APP_DIR.resolve()
+    if p == app or app in p.parents:
+        raise UserError("That is FileFixer's own folder. Please choose a different one.")
+    return p
+
+
+def in_protected_dir(p) -> bool:
+    """True if this path is inside a Windows/system or program folder."""
+    try:
+        rp = Path(p).resolve()
+    except (OSError, RuntimeError):
+        return False
     for bad in _protected_dirs():
         try:
             b = bad.resolve()
         except OSError:
             continue
-        if p == b or b in p.parents:
-            raise UserError("That folder belongs to your computer's system, so FileFixer won't touch it.\n"
-                            "Please choose one of your own folders (Documents, Downloads, ...).")
-    app = APP_DIR.resolve()
-    if p == app or app in p.parents:
-        raise UserError("That is FileFixer's own folder. Please choose a different one.")
-    return p
+        if rp == b or b in rp.parents:
+            return True
+    return False
+
+
+def check_editable(p: Path) -> Path:
+    """A file FileFixer may change or replace: not a link, and not part of the computer's system."""
+    if in_protected_dir(p):
+        raise UserError(f"{Path(p).name} belongs to your computer's system, so FileFixer won't change it.\n"
+                        "Choose “Create a new file” instead, or pick one of your own files.")
+    if is_link(p):
+        raise UserError(f"{Path(p).name} is a shortcut (link) to somewhere else, so FileFixer won't change it.")
+    return Path(p)
 
 
 def check_file(text) -> Path:
@@ -156,8 +212,12 @@ def parse_exts(text) -> Optional[set]:
     return out or None
 
 
-def list_files(folder: Path, subfolders: bool, exts: Optional[set] = None) -> list:
-    """Regular files in a folder (optionally below it), skipping hidden/system junk."""
+def list_files(folder: Path, subfolders: bool, exts: Optional[set] = None, problems: Optional[list] = None) -> list:
+    """Regular files in a folder (optionally below it), skipping hidden/system junk.
+
+    Folders that can't be opened are never hidden: if `problems` is given, a plain-English line about each
+    one is added to it so the job can warn that the result may be incomplete.
+    """
     app = APP_DIR.resolve()
 
     def keep(p: Path) -> bool:
@@ -168,9 +228,13 @@ def list_files(folder: Path, subfolders: bool, exts: Optional[set] = None) -> li
             return False
         return not exts or p.suffix.lower() in exts
 
+    def oops(err: OSError) -> None:
+        if problems is not None:
+            problems.append(f"{getattr(err, 'filename', '') or folder}: {friendly(err)}")
+
     result = []
     if subfolders:
-        for root, dirs, files in os.walk(folder):
+        for root, dirs, files in os.walk(folder, onerror=oops):
             check_cancel()
             rp = Path(root)
             dirs[:] = sorted(d for d in dirs
@@ -179,7 +243,10 @@ def list_files(folder: Path, subfolders: bool, exts: Optional[set] = None) -> li
                              and (rp / d).resolve() != app)
             result += [rp / f for f in sorted(files) if keep(rp / f)]
     else:
-        result = [p for p in sorted(folder.iterdir()) if keep(p)]
+        try:
+            result = [p for p in sorted(folder.iterdir()) if keep(p)]
+        except OSError as err:
+            raise UserError(f"I can't open this folder: {friendly(err)}.\n{folder}")
     return result
 
 
@@ -299,7 +366,14 @@ def _move(src: Path, dst: Path) -> None:
     if norm(src) == norm(dst) and str(src) != str(dst):          # case-only rename on Windows/Mac
         tmp = src.with_name(f"{src.name}.{uuid.uuid4().hex[:8]}.fftmp")
         os.rename(src, tmp)
-        os.rename(tmp, dst)
+        try:
+            os.rename(tmp, dst)
+        except BaseException:
+            try:
+                os.rename(tmp, src)                     # put it back: never leave a file stranded as *.fftmp
+            except OSError:
+                pass
+            raise
         return
     if dst.exists():
         raise FileExistsError(f"'{dst.name}' already exists there")
@@ -311,6 +385,8 @@ def _check_guard(a: Action) -> None:
         try:
             st = os.lstat(path)
             now = (st.st_size, st.st_mtime)
+            if size is not None and is_link(path):          # a file swapped for a shortcut is not "unchanged"
+                now = ("link", 0)
         except OSError:
             now = None
         want = None if size is None else (size, mtime)
@@ -319,8 +395,53 @@ def _check_guard(a: Action) -> None:
                             "Show me what will happen again to include the newer version")
 
 
+MUTATING = ("move", "trash", "edit", "overwrite", "copy", "write", "zip", "mkdir")
+
+
+def _check_targets(a: Action) -> None:
+    """Last line of defence: never change system folders, and never act through a link."""
+    for p in (a.src if a.kind in ("move", "trash", "edit", "overwrite") else None, a.dst):
+        if p is not None and in_protected_dir(p):
+            raise UserError(f"{Path(p).name} is in a system folder, so it was left alone")
+    if a.kind in ("move", "trash", "edit", "overwrite", "zip") and a.src is not None and is_link(a.src):
+        raise UserError(f"{a.src.name} is now a shortcut (link), so it was left alone")
+    if a.dst is not None and a.kind in ("edit", "overwrite", "write", "copy", "move") and is_link(a.dst):
+        raise UserError(f"{a.dst.name} is a shortcut (link), so it was left alone")
+
+
+def _atomic_write(dst: Path, data: bytes) -> None:
+    """Write beside the target, then swap into place: an interrupted write never leaves a half file."""
+    tmp = dst.with_name(dst.name + ".fftmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dst)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def write_text_atomic(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """Save app data (settings, workflows, scripts, logs) without ever leaving a half-written file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def _do(a: Action, bdir: Path) -> Optional[dict]:
     _check_guard(a)
+    _check_targets(a)
     if a.kind == "move":
         made = _missing_dirs(a.dst.parent)
         _move(a.src, a.dst)
@@ -419,7 +540,9 @@ def _do(a: Action, bdir: Path) -> Optional[dict]:
         data = text.encode(enc)
         made = _missing_dirs(a.dst.parent)
         a.dst.parent.mkdir(parents=True, exist_ok=True)
-        a.dst.write_bytes(data)
+        if a.dst.exists():
+            raise FileExistsError(f"'{a.dst.name}' already exists there")
+        _atomic_write(a.dst, data)
         return {"op": "write", "src": "", "dst": str(a.dst), "made": [str(d) for d in made]}
 
     raise ValueError(f"Unknown action {a.kind}")
@@ -440,12 +563,28 @@ def save_history(h: list) -> None:
     os.replace(tmp, HISTORY_FILE)
 
 
+def _journal(entry: dict) -> None:
+    """Save this batch to history now (adding it, or replacing its earlier version)."""
+    with HISTORY_LOCK:
+        h = load_history()
+        for i, b in enumerate(h):
+            if b.get("id") == entry["id"]:
+                h[i] = entry
+                break
+        else:
+            h.append(entry)
+        save_history(h)
+
+
 def apply_plan(plan: Plan, progress: Optional[Callable[[int, int], None]] = None) -> dict:
     batch_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     bdir = RECYCLE_DIR / batch_id
     records, problems = [], []
+    entry = {"id": batch_id, "title": plan.title, "time": datetime.now().isoformat(timespec="seconds"),
+             "records": records, "undone": False}
     stopped_early = False
     total = len(plan.actions)
+    last_saved, saved_n = time.time(), 0
     for i, a in enumerate(plan.actions, 1):
         if _cancel.is_set():
             problems.append(f"Stopped early at your request: {total - i + 1} of {total} changes were not made.")
@@ -458,14 +597,18 @@ def apply_plan(plan: Plan, progress: Optional[Callable[[int, int], None]] = None
         except Exception as e:                       # one bad file must not stop the rest
             name = (a.src or a.dst).name
             problems.append(f"{name}: {friendly(e)}")
+        # Keep the undo list up to date while working, so a crash, power cut or closed window
+        # in the middle of a big job can still be undone for everything done so far.
+        if len(records) > saved_n and time.time() - last_saved >= max(0.5, len(records) / 4000):
+            try:
+                _journal(entry)
+                saved_n, last_saved = len(records), time.time()
+            except OSError:
+                pass
         if progress:
             progress(i, total)
     if records:
-        with HISTORY_LOCK:
-            h = load_history()
-            h.append({"id": batch_id, "title": plan.title, "time": datetime.now().isoformat(timespec="seconds"),
-                      "records": records, "undone": False})
-            save_history(h)
+        _journal(entry)
     result = {"done": len(records), "problems": problems, "batch": batch_id,
               "recycle": str(bdir) if bdir.exists() else "",
               "open_path": str(plan.open_path) if plan.open_path and Path(plan.open_path).exists() else ""}
@@ -531,7 +674,16 @@ def _undo_last(progress: Optional[Callable[[int, int], None]] = None) -> dict:
                 backup = Path(r["backup"])
                 if not backup.exists():
                     raise FileNotFoundError()
-                shutil.copy2(backup, dst)
+                tmp = dst.with_name(dst.name + ".fftmp")          # restore beside, then swap in
+                try:
+                    shutil.copy2(backup, tmp)
+                    os.replace(tmp, dst)
+                finally:
+                    if tmp.exists():
+                        try:
+                            tmp.unlink()
+                        except OSError:
+                            pass
             elif r["op"] == "mkdir":
                 try:
                     dst.rmdir()

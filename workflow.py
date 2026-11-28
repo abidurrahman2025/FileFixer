@@ -7,6 +7,7 @@ workflow definitions; results are written through engine plans (preview, backup,
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -15,7 +16,7 @@ import engine
 import r_extract as X
 import readers
 from engine import Action, Namer, Plan, UserError, check_folder
-from recipes import check_name_text, natural_key, plural
+from recipes import check_name_text, check_new_name, name_problem, natural_key, plural, with_extension
 
 CASE = ("case", "check", False, None, "Match capital letters exactly")
 
@@ -46,6 +47,7 @@ OPS = {
 }
 WORKFLOW_DIR = engine.APP_DIR / "workflows"
 RUNS_FILE = engine.APP_DIR / "runs.json"
+NL = "\r\n" if os.name == "nt" else "\n"
 
 
 def default_params(op: str) -> dict:
@@ -143,17 +145,22 @@ def run_steps(steps: list, text: str) -> tuple:
 # ---- saving workflows --------------------------------------------------------
 def _safe(name: str) -> str:
     name = name.strip()
-    check_name_text(name, "The name")
     if not name:
-        raise UserError("Please give the workflow a name.")
+        raise UserError("Please give it a name.")
+    check_name_text(name, "The name")
+    if name_problem(name) or name.strip(". ") == "":
+        raise UserError(f"“{name}” can't be used as a name (it can't end with a dot or a space, "
+                        "or be a name Windows keeps for itself). Please choose another.")
     return name
 
 
 def save_workflow(name: str, steps: list) -> Path:
     name = _safe(name)
-    WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
     p = WORKFLOW_DIR / f"{name}.json"
-    p.write_text(json.dumps({"name": name, "steps": steps}, indent=1), "utf-8")
+    try:
+        engine.write_text_atomic(p, json.dumps({"name": name, "steps": steps}, indent=1))
+    except OSError as e:
+        raise UserError(f"I couldn't save the workflow: {e.strerror or e}")
     return p
 
 
@@ -186,9 +193,11 @@ SCRIPT_DIR = engine.APP_DIR / "scripts"
 
 def save_script(name: str, code: str) -> Path:
     name = _safe(name)
-    SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     p = SCRIPT_DIR / (name if name.endswith(".py") else name + ".py")
-    p.write_text(code, "utf-8")
+    try:
+        engine.write_text_atomic(p, code)
+    except OSError as e:
+        raise UserError(f"I couldn't save the script: {e.strerror or e}")
     return p
 
 
@@ -212,8 +221,7 @@ def log_run(kind: str, name: str, status: str, detail: str, payload=None) -> Non
             runs = []
         runs.append({"time": engine.datetime.now().isoformat(timespec="seconds"), "kind": kind, "name": name,
                      "status": status, "detail": detail[:20000], "payload": payload})
-        engine.APP_DIR.mkdir(parents=True, exist_ok=True)
-        RUNS_FILE.write_text(json.dumps(runs[-200:], indent=1), "utf-8")
+        engine.write_text_atomic(RUNS_FILE, json.dumps(runs[-200:], indent=1))
 
 
 def load_runs() -> list:
@@ -251,14 +259,13 @@ def regex_apply(pattern: str, text: str, mode: str, repl: str = "", ignorecase: 
 
 def file_output_plan(title: str, src: Path, body: str, outdir: Optional[str], outname: str, default: str) -> Plan:
     """A plan that saves `body` as a new text file (never overwrites)."""
-    name = outname.strip() or default
-    check_name_text(name, "The file name")
-    if not Path(name).suffix:
-        name += ".txt"
+    name = with_extension(outname.strip() or default, ".txt")
+    check_new_name(name, "The file name")
     folder = check_folder(outdir) if outdir and outdir.strip() else src.parent
     dst = Namer().reserve(folder / name)
     plan = Plan(title)
-    plan.actions.append(Action("write", f"A new file will be created:   {dst}", dst=dst, produce=lambda t=body: (t, "utf-8")))
+    text = body.replace("\n", NL)
+    plan.actions.append(Action("write", f"A new file will be created:   {dst}", dst=dst, produce=lambda t=text: (t, "utf-8")))
     plan.open_path = dst
     plan.notes.append(f"The original file {src.name} is not changed.")
     if dst.name != name:
@@ -278,9 +285,14 @@ def batch_plan(steps: list, files: list, outdir: str, suffix: str) -> Plan:
         except UserError as e:
             failed.append(f"{Path(f).name}: {e}")
             continue
-        dst = namer.reserve(folder / f"{Path(f).stem}{suffix}.txt")
+        new_name = f"{Path(f).stem}{suffix}.txt"
+        if name_problem(new_name):
+            failed.append(f"{Path(f).name}: the new name isn't allowed on Windows")
+            continue
+        dst = namer.reserve(folder / new_name)
+        text = out.replace("\n", NL)
         plan.actions.append(Action("write", f"{Path(f).name}   →   {dst.name}   ({plural(len(out.splitlines()), 'line')})",
-                                   dst=dst, produce=lambda t=out: (t, "utf-8")))
+                                   dst=dst, produce=lambda t=text: (t, "utf-8")))
     plan.notes += [f"Skipped {x}" for x in failed]
     plan.summary = (f"{plural(len(plan.actions), 'new file')} will be created in {folder}." if plan.actions
                     else "Nothing to create.")

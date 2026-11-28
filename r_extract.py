@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 import readers
-from engine import (Action, Namer, NotText, Plan, UserError, check_file, check_folder, decode_bytes)
-from recipes import Field, Recipe, check_new_name, plural
+from engine import Action, Namer, Plan, UserError, check_editable, check_file, check_folder
+from recipes import Field, Recipe, check_new_name, plural, with_extension
 
 HOW = ["Starts with", "Ends with", "Contains", "Is exactly", "Regular expression (advanced)"]
 SPLIT = ["Whitespace (spaces, tabs, line breaks)", "Each line is one item", "Only my own separators"]
@@ -155,6 +155,7 @@ class ExtractWords(Recipe):
         plan.report = shown.split("\n")
 
         if v["result"] == RESULT[1]:
+            check_editable(src)
             crlf = "\r\n" in text
             new_text = body.replace("\n", "\r\n") if crlf else body
             plan.actions.append(Action("edit", f"The text in {src.name} will be replaced by the results", src, src,
@@ -166,8 +167,7 @@ class ExtractWords(Recipe):
             return plan
 
         name = v["outname"].strip() or f"{src.stem}List.txt"
-        if not Path(name).suffix:
-            name += ".txt"
+        name = with_extension(name, ".txt")
         check_new_name(name, "The file name")
         outdir = check_folder(v["outdir"]) if v["outdir"].strip() else src.parent
         dst = Namer().reserve(outdir / name)
